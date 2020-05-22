@@ -124,7 +124,7 @@ struct retro_core_option_definition option_defs_chs[] = {
    },
    {
       "picodrive_aspect",
-      "内核提供宽高比",
+      "显示宽高比",
       "选择期望的显示宽高比。\n"
       "此项设置只有当RetroArch的宽高比设为‘内核提供’时有效。",
       {
