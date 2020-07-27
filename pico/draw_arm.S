@@ -1,6 +1,7 @@
 /*
  * assembly optimized versions of most funtions from draw.c
  * (C) notaz, 2006-2010,2017
+ * (C) kub, 2020
  *
  * This work is licensed under the terms of MAME license.
  * See COPYING file in the top-level directory.
@@ -8,13 +9,13 @@
  * this is highly specialized, be careful if changing related C code!
  */
 
-#include "pico_int_o32.h"
+#include "pico_int_offs.h"
 
 .extern DrawStripInterlace
 
 .equ PDRAW_SPRITES_MOVED, (1<<0)
 .equ PDRAW_WND_DIFF_PRIO, (1<<1)
-.equ PDRAW_ACC_SPRITES,   (1<<2)
+.equ PDRAW_PARSE_SPRITES, (1<<2)
 .equ PDRAW_DIRTY_SPRITES, (1<<4)
 .equ PDRAW_PLANE_HI_PRIO, (1<<6)
 .equ PDRAW_SHHI_DONE,     (1<<7)
@@ -317,9 +318,10 @@ DrawLayer:
     moveq   r1,      #0x0007
     movgt   r1,      #0x00ff      @ r1=ymask=(height<<8)|0xff; ...; // Y Mask in pixels
 
-    add     r10, r10, #5
-    cmp     r10, #7
-    subge   r10, r10, #1          @ r10=shift[width] (5,6,6,7)
+    cmp     r10, #2
+    addlt   r10, r10, #5
+    moveq   r10, #5
+    movgt   r10, #7               @ r10=shift[width] (5,6,5,7)
 
     ldr     r2, [r12, #OFS_EST_DrawScanline]
     ldr     lr, [r12, #OFS_EST_PicoMem_vram]
@@ -342,11 +344,15 @@ DrawLayer:
 
     mov     r4, r8, lsr #8        @ pvid->reg[13]
     mov     r4, r4, lsl #10       @ htab=pvid->reg[13]<<9; (halfwords)
-    tst     r7, #2
-    addne   r4, r4, r2, lsl #2    @ htab+=DrawScanline<<1; // Offset by line
-    tst     r7, #1
-    biceq   r4, r4, #0x1f         @ htab&=~0xf; // Offset by tile
-    add     r4, r4, r0, lsl #1    @ htab+=plane
+
+    ands    r3, r7, #0x03
+    beq     0f
+    cmp     r3, #2
+    mov     r3, r2, lsl #2        @ htab+=DrawScanline<<1; // Offset by line
+    biceq   r3, #0x1f             @ htab&=~0xf; // Offset by tile
+    andlt   r3, #0x1f
+    add     r4, r4, r3
+0:  add     r4, r4, r0, lsl #1    @ htab+=plane
     bic     r4, r4, #0x00ff0000   @ just in case
     ldrh    r3, [lr, r4]          @ r3=hscroll
 
@@ -362,7 +368,8 @@ DrawLayer:
     bne     .DrawStrip_interlace
 
     tst     r0, r0
-    movne   r7, r7, lsr #16
+    moveq   r7, r7, lsl #16
+    mov     r7, r7, lsr #16
 
     @ Find the line in the name table
     add     r2, r2, r7
@@ -517,6 +524,9 @@ DrawLayer:
 @ @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
 .DrawStrip_vsscroll:
+    tst     r8, #1                @ if h40: lflags |= 0x10000
+    orrne   r0, r0, #0x10000
+
     rsb     r8, r3, #0
     mov     r8, r8, lsr #3        @ r8=tilex=(-ts->hscroll)>>3
     bic     r8, r8, #0x3fc00000
@@ -541,6 +551,12 @@ DrawLayer:
     tst     r3, #0x08
     subne   r10,r10, #1<<16       @ cells--
     subne   r10,r10, #1<<24       @ cell--  // even more negative
+
+    add_c24 r1, lr, (OFS_PMEM_vsram-OFS_PMEM_vram)
+    tst     r0, #0x10000          @ h40?
+    ldrne   r3, [r1, #0x00]       @ r3=vsram[0x00..0x01]
+    ldreq   r3, [r1, #0x40]       @ r3=vsram[0x20..0x21]
+    str     r3, [r1, #0x7c]       @ vsram[0x3e..0x3f]=r3
 0:
     tst     r9, #1<<31
     mov     r3, #0
@@ -571,8 +587,8 @@ DrawLayer:
 
     @ calc offset and read tileline code to r7, also calc ty
     add_c24 r7, lr, (OFS_PMEM_vsram-OFS_PMEM_vram)
-    add     r7, r7, r10,asr #23   @ vsram + ((cell&~1)<<1)
-    bic     r7, r7, #3
+    and     r4, r10, #0x3e000000
+    add     r7, r7, r4, asr #23   @ vsram + ((cell&0x3e)<<1)
     tst     r10,#0x8000           @ plane1?
     addne   r7, r7, #2
     ldrh    r7, [r7]              @ r7=vscroll
@@ -599,6 +615,7 @@ DrawLayer:
     tst     r7, #0x8000
     bne     .DrawStrip_vs_hiprio
 
+    orr     r7, r7, r10, lsl #24  @ code | (ty << 24)
     cmp     r7, r9
     beq     .DrawStrip_vs_samecode @ we know stuff about this tile already
 
@@ -694,8 +711,8 @@ DrawLayer:
 @ interlace mode 2? Sonic 2?
 .DrawStrip_interlace:
     tst     r0, r0
-    moveq   r7, r7, lsl #21
-    movne   r7, r7, lsl #5
+    movne   r7, r7, lsr #16
+    mov     r7, r7, lsl #21
 
     @ Find the line in the name table
     add     r2, r7, r2, lsl #22    @ r2=(vscroll+(DrawScanline<<1))<<21 (11 bits);
@@ -790,7 +807,6 @@ DrawTilesFromCache:
     add     r1, r11, r4     @ r1=pdest
 
     movs    r7, r6, lsl #16
-    bpl     .dtfc_loop      @ !(code & 0x8000)
     cmp     r5, r7, lsr #16
     beq     .dtfc_samecode  @ if (code==prevcode)
 
@@ -942,17 +958,23 @@ DrawTilesFromCache:
 .global DrawSpritesSHi
 
 DrawSpritesSHi:
-    ldr     r3, [r0]
+    ldrb    r3, [r0]
     mov     r12,#0xff
     ands    r3, r3, #0x7f
     bxeq    lr
 
-    stmfd   sp!, {r1,r4-r11,lr} @ +est
-    strb    r12,[r0,#2]     @ set end marker
-    add     r10,r0, #3      @ r10=HighLnSpr end
+    stmfd   sp!, {r1,r3-r11,lr} @ +est
+    strb    r12,[r0,#3]     @ set end marker
+    ldrb    r12,[r0,#1]
+    add     r10,r0, #4      @ r10=HighLnSpr end
+    mvn     r12,r12
+    tst     r12,#0x6        @ masking in slot 1 and tile ovfl?
+    ldmeqfd sp!, {r1,r3-r11,pc}
     add     r10,r10,r3      @ r10=HighLnSpr end
 
+    ldrb    r12,[r10,#0]    @ width of last sprite
     ldr     r11,[r1, #OFS_EST_HighCol]
+    str     r12,[sp, #4]
     mov     r12,#0xf
     ldr     lr, [r1, #OFS_EST_PicoMem_vram]
 
@@ -963,7 +985,7 @@ DrawSpriteSHi:
     ldr     r7, [sp]        @ est
     ldr     r1, [r7, #OFS_EST_HighPreSpr]
     cmp     r0, #0xff
-    ldmeqfd sp!, {r1,r4-r11,pc} @ end of list
+    ldmeqfd sp!, {r1,r3-r11,pc} @ end of list
     and     r0, r0, #0x7f
     add     r0, r1, r0, lsl #3
 
@@ -1007,10 +1029,16 @@ DrawSpriteSHi:
     and     r7, r7, #7
     add     r8, r8, r7, lsl #1 @ tile+=(row&7)<<1; // Tile address
 
+    ldr     r0, [sp, #4]
+    add     r6, r6, #1         @ inc now
+    cmp     r0, #0             @ check width of last sprite
+    movne   r6, r0
+    movne   r0, #0
+    strne   r0, [sp, #4]
+
     mov     r5, r5, lsl #4     @ delta<<=4; // Delta of address
     mov     r3, r4, lsr #9     @ r3=pal=((code>>9)&0x30);
 
-    add     r6, r6, #1         @ inc now
     adds    r0, r2, #0         @ mov sx to r0 and set ZV flags
     b       .dsprShi_loop_enter
 
@@ -1126,11 +1154,18 @@ DrawAllSprites:
     @ time to do some real work
     stmfd   sp!, {r1,r3-r11,lr} @ +sh|prio<<1 +est
     mov     r12,#0xff
-    strb    r12,[r0,#2]     @ set end marker
-    add     r10,r0, #3
+    strb    r12,[r0,#3]     @ set end marker
+    ldrb    r12,[r0,#1]
+    add     r10,r0 ,#4
+    mvn     r12,r12
+    tst     r12,#0x6        @ masking in slot 1 and tile ovfl?
+    ldmeqfd sp!, {r1,r3-r11,pc}
     add     r10,r10,r2      @ r10=HighLnSpr end
 
+    ldrb    r12,[r10,#0]    @ width of last sprite
     ldr     r11,[r3, #OFS_EST_HighCol]
+    orr     r1 ,r1 ,r12,lsl #24
+    str     r1, [sp]
     mov     r12,#0xf
     ldr     lr, [r3, #OFS_EST_PicoMem_vram]
 
@@ -1140,13 +1175,15 @@ DrawAllSprites:
 DrawSprite:
     @ draw next sprite
     ldrb    r0, [r10,#-1]!
-    ldr     r8, [sp]        @ sh|prio<<1
+    ldr     r4, [sp]        @ sh|prio<<1|lastw<<24
     ldr     r7, [sp, #4]    @ est
-    mov     r2, r0, lsr #7
+    mov     r2, r0, lsl #24
     cmp     r0, #0xff
     ldmeqfd sp!, {r1,r3-r11,pc} @ end of list
-    cmp     r2, r8, lsr #1
-    bne     DrawSprite      @ wrong priority
+    eors    r2, r2, r4, lsl #30
+    bic     r2, r4, #0xff000000
+    str     r2, [sp]
+    bmi     DrawSprite      @ wrong priority
     ldr     r1, [r7, #OFS_EST_HighPreSpr]
     and     r0, r0, #0x7f
     add     r0, r1, r0, lsl #3
@@ -1158,20 +1195,20 @@ DrawSprite:
     mov     r5, r3, lsr #24
     and     r5, r5, #7      @ r5=height
 
-    mov     r4, r3, lsl #16 @ r4=sy<<16 (tmp)
+    mov     r8, r3, lsl #16 @ r8=sy<<16 (tmp)
 
     ldr     r9, [r0, #4]
-    sub     r7, r7, r4, asr #16 @ r7=row=DrawScanline-sy
+    sub     r7, r7, r8, asr #16 @ r7=row=DrawScanline-sy
 
     mov     r2, r9, asr #16 @ r2=sx
     mov     r9, r9, lsl #16
     mov     r9, r9, lsr #16
-    orr     r9, r9, r8, lsl #31 @ r9=code|sh[31]
+    orr     r9, r9, r4, lsl #31 @ r9=code|sh[31]
 
     tst     r9, #0x1000
-    movne   r4, r5, lsl #3
-    subne   r4, r4, #1
-    subne   r7, r4, r7      @ if (code&0x1000) row=(height<<3)-1-row; // Flip Y
+    movne   r8, r5, lsl #3
+    subne   r8, r8, #1
+    subne   r7, r8, r7      @ if (code&0x1000) row=(height<<3)-1-row; // Flip Y
 
     add     r8, r9, r7, lsr #3 @ tile+=row>>3; // Tile number increases going down
     tst     r9, #0x0800
@@ -1183,7 +1220,10 @@ DrawSprite:
     and     r7, r7, #7
     add     r8, r8, r7, lsl #1 @ tile+=(row&7)<<1; // Tile address
 
-.dspr_continue:
+    add     r6, r6, #1         @ inc now
+    cmp     r4, #0x1000000     @ check width of last sprite
+    movhs   r6, r4, lsr #24
+
     @ cache some stuff to avoid mem access
     mov     r5, r5, lsl #4     @ delta<<=4; // Delta of address
     and     r4, r9, #0x6000
@@ -1193,7 +1233,6 @@ DrawSprite:
     mov     r3, r4, lsr #9     @ r3=pal=((code>>9)&0x30);
     orrmi   r3, r3, #0x40      @ for sh/hi
 
-    add     r6, r6, #1         @ inc now
     adds    r0, r2, #0         @ mov sx to r0 and set ZV flags
     b       .dspr_loop_enter
 
@@ -1498,11 +1537,9 @@ vidConvCpyRGB565: @ void *to, void *from, int pixels
 PicoDoHighPal555:
     stmfd   sp!, {r4-r10,lr}
     mov     r10,r2               @ est
-    mov     r1, #0
     ldr     r8, [r10, #OFS_EST_Pico]
 
-PicoDoHighPal555_nopush:
-    orr     r9, r1, r0, lsl #31  @ 0:called from FinalizeLine555, 31: s/h
+    mov     r9, r0
 
     add     r0, r10, #OFS_EST_HighPal
 
@@ -1517,7 +1554,7 @@ PicoDoHighPal555_nopush:
 
     vidConvCpyRGB565_local
 
-    tst     r9, #(1<<31)
+    cmp     r9, #0
     beq     PicoDoHighPal555_end
 
     add     r3, r10, #OFS_EST_HighPal
@@ -1560,11 +1597,7 @@ PicoDoHighPal555_nopush:
     mov     r0, #1
 
 PicoDoHighPal555_end:
-    tst     r9, #1
-    ldmeqfd sp!, {r4-r10,pc}
-
-    ldr     r8, [r10, #OFS_EST_Pico]
-    b       FinalizeLineRGB555_pal_done
+    ldmfd   sp!, {r4-r10,pc}
 
 
 @ void FinalizeLine555(int sh, int line, struct PicoEState *est)
@@ -1576,19 +1609,11 @@ FinalizeLine555:
     mov     r10,r2               @ est
     ldr     r8, [r10, #OFS_EST_Pico]
 
-    ldrb    r2, [r8, #OFS_Pico_m_dirtyPal]
-    mov     r1, #1
-    tst     r2, r2
-    bne     PicoDoHighPal555_nopush
+    bl      PicoDrawUpdateHighPal
 
-FinalizeLineRGB555_pal_done:
     add     r3, r10, #OFS_EST_HighPal
 
-    ldr     r12, [r10, #OFS_EST_rendstatus]
-    eors    r0, r0, #1           @ sh is 0
     mov     lr, #0xff
-    tstne   r12,#PDRAW_ACC_SPRITES
-    movne   lr, #0x3f
 
     ldr     r1, [r10, #OFS_EST_HighCol]
     ldr     r0, [r10, #OFS_EST_DrawLineDest]

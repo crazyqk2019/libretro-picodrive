@@ -4,19 +4,6 @@ CFLAGS += -I.
 CYCLONE_CC ?= gcc
 CYCLONE_CXX ?= g++
 
-ifneq ("$(PLATFORM)", "libretro")
-	CFLAGS += -Wall -g
-	ifndef DEBUG
-	CFLAGS += -O3 -DNDEBUG
-	endif
-endif
-
-# This is actually needed, bevieve me.
-# If you really have to disable this, set NO_ALIGN_FUNCTIONS elsewhere.
-ifndef NO_ALIGN_FUNCTIONS
-CFLAGS += -falign-functions=2
-endif
-
 all: config.mak target_
 
 ifndef NO_CONFIG_MAK
@@ -34,6 +21,39 @@ else # NO_CONFIG_MAK
 config.mak:
 endif
 
+# This is actually needed, believe me.
+# If you really have to disable this, set NO_ALIGN_FUNCTIONS elsewhere.
+ifndef NO_ALIGN_FUNCTIONS
+CFLAGS += -falign-functions=2
+endif
+
+# profiling
+pprof ?= 0
+gperf ?= 0
+
+ifneq ("$(PLATFORM)", "libretro")
+	CFLAGS += -Wall -g
+ifneq ($(findstring gcc,$(CC)),)
+	CFLAGS += -ffunction-sections -fdata-sections
+	LDFLAGS += -Wl,--gc-sections
+endif
+	ifndef DEBUG
+	CFLAGS += -O3 -DNDEBUG
+	endif
+
+	LD = $(CC)
+	OBJOUT ?= -o
+	LINKOUT ?= -o
+endif
+
+ifeq ("$(PLATFORM)",$(filter "$(PLATFORM)","gp2x" "opendingux" "rpi1"))
+# very small caches, avoid optimization options making the binary much bigger
+CFLAGS += -finline-limit=42 -fno-unroll-loops -fno-ipa-cp -ffast-math
+# this gets you about 20% better execution speed on 32bit arm/mips
+CFLAGS += -fno-common -fno-stack-protector -fno-guess-branch-probability -fno-caller-saves -fno-tree-loop-if-convert -fno-regmove
+endif
+#OBJS += align.o
+
 # default settings
 ifeq "$(ARCH)" "arm"
 use_cyclone ?= 1
@@ -47,10 +67,12 @@ asm_ym2612 ?= 1
 asm_misc ?= 1
 asm_cdmemory ?= 1
 asm_mix ?= 1
-else # if not arm
+asm_32xdraw ?= 1
+asm_32xmemory ?= 1
+else
 use_fame ?= 1
 use_cz80 ?= 1
-ifneq (,$(findstring 86,$(ARCH)))
+ifneq (,$(filter x86% i386% mips% aarch% riscv% powerpc% ppc%, $(ARCH)))
 use_sh2drc ?= 1
 endif
 endif
@@ -91,6 +113,7 @@ OBJS += platform/libpicofe/gl_platform.o
 USE_FRONTEND = 1
 endif
 ifeq "$(PLATFORM)" "generic"
+CFLAGS += -DSDL_OVERLAY_2X
 OBJS += platform/linux/emu.o platform/linux/blit.o # FIXME
 OBJS += platform/common/plat_sdl.o
 OBJS += platform/libpicofe/plat_sdl.o platform/libpicofe/in_sdl.o
@@ -124,6 +147,8 @@ OBJS += platform/gp2x/vid_pollux.o
 OBJS += platform/gp2x/warm.o 
 USE_FRONTEND = 1
 PLATFORM_MP3 = 1
+PLATFORM_ZLIB = 1
+HAVE_ARMv6 = 0
 endif
 ifeq "$(PLATFORM)" "libretro"
 OBJS += platform/libretro/libretro.o
@@ -135,6 +160,7 @@ OBJS += platform/libretro/libretro-common/streams/file_stream.o
 OBJS += platform/libretro/libretro-common/streams/file_stream_transforms.o
 OBJS += platform/libretro/libretro-common/vfs/vfs_implementation.o
 endif
+PLATFORM_ZLIB = 1
 endif
 
 ifeq "$(USE_FRONTEND)" "1"
@@ -169,15 +195,17 @@ endif
 
 endif # USE_FRONTEND
 
-OBJS += platform/common/mp3.o
+OBJS += platform/common/mp3.o platform/common/mp3_sync.o
 ifeq "$(PLATFORM_MP3)" "1"
+platform/common/mp3_helix.o: CFLAGS += -Iplatform/libpicofe
+OBJS += platform/common/mp3_helix.o
 else ifeq "$(HAVE_LIBAVCODEC)" "1"
 OBJS += platform/common/mp3_libavcodec.o
 else
 OBJS += platform/common/mp3_dummy.o
 endif
 
-ifeq "$(PLATFORM)" "libretro"
+ifeq "$(PLATFORM_ZLIB)" "1"
 # zlib
 OBJS += zlib/gzio.o zlib/inffast.o zlib/inflate.o zlib/inftrees.o zlib/trees.o \
 	zlib/deflate.o zlib/crc32.o zlib/adler32.o zlib/zutil.o zlib/compress.o zlib/uncompr.o
@@ -201,7 +229,7 @@ endif
 target_: $(TARGET)
 
 clean:
-	$(RM) $(TARGET) $(OBJS)
+	$(RM) $(TARGET) $(OBJS) pico/pico_int_offs.h
 	$(RM) -r .opk_data
 
 $(TARGET): $(OBJS)
@@ -213,10 +241,10 @@ else
 endif
 
 pprof: platform/linux/pprof.c
-	$(CC) -O2 -ggdb -DPPROF -DPPROF_TOOL -I../../ -I. $^ -o $@
+	$(CC) $(CFLAGS) -O2 -ggdb -DPPROF -DPPROF_TOOL -I../../ -I. $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
-tools/textfilter: tools/textfilter.c
-	make -C tools/ textfilter
+pico/pico_int_offs.h: tools/mkoffsets.sh
+	make -C tools/ XCC="$(CC)" XCFLAGS="$(CFLAGS)" XPLATFORM="$(platform)"
 
 %.o: %.c
 	$(CC) -c $(OBJOUT)$@ $< $(CFLAGS)
@@ -236,6 +264,14 @@ pico/cd/cd_file.o: CFLAGS += -fno-strict-aliasing
 pico/cd/pcm.o: CFLAGS += -fno-strict-aliasing
 pico/cd/LC89510.o: CFLAGS += -fno-strict-aliasing
 pico/cd/gfx_cd.o: CFLAGS += -fno-strict-aliasing
+ifeq (1,$(use_sh2drc))
+ifneq (,$(findstring -flto,$(CFLAGS)))
+# if using the DRC, memory and sh2soc directly use the DRC register for SH2 SR
+# to avoid saving and reloading it. However, this collides with the use of LTO.
+pico/32x/memory.o: CFLAGS += -fno-lto
+pico/32x/sh2soc.o: CFLAGS += -fno-lto
+endif
+endif
 
 # fame needs ~2GB of RAM to compile on gcc 4.8
 # on x86, this is reduced by ~300MB when debug info is off (but not on ARM)
@@ -252,10 +288,13 @@ endif
 pico/carthw_cfg.c: pico/carthw.cfg
 	tools/make_carthw_c $< $@
 
+# preprocessed asm files most probably include the offsets file
+$(filter %.S,$(SRCS_COMMON)): pico/pico_int_offs.h
+
 # random deps
 pico/carthw/svp/compiler.o : cpu/drc/emit_arm.c
-cpu/sh2/compiler.o : cpu/drc/emit_arm.c
-cpu/sh2/compiler.o : cpu/drc/emit_x86.c
+cpu/sh2/compiler.o : cpu/drc/emit_arm.c cpu/drc/emit_arm64.c cpu/drc/emit_ppc.c
+cpu/sh2/compiler.o : cpu/drc/emit_x86.c cpu/drc/emit_mips.c cpu/drc/emit_riscv.c
 cpu/sh2/mame/sh2pico.o : cpu/sh2/mame/sh2.c
 pico/pico.o pico/cd/mcd.o pico/32x/32x.o : pico/pico_cmn.c pico/pico_int.h
 pico/memory.o pico/cd/memory.o pico/32x/memory.o : pico/pico_int.h pico/memory.h

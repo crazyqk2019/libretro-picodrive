@@ -20,7 +20,7 @@
 #define LINE_WIDTH 328
 #endif
 
-static unsigned char PicoDraw2FB_[(8+320) * (8+240+8)];
+static unsigned char PicoDraw2FB_[(8+320) * (8+240+8) + 8];
 
 static int HighCache2A[41*(TILE_ROWS+1)+1+1]; // caches for high layers
 static int HighCache2B[41*(TILE_ROWS+1)+1+1];
@@ -157,6 +157,8 @@ static void DrawWindowFull(int start, int end, int prio, struct PicoEState *est)
 	{
 		nametab=(pvid->reg[3]&0x3e)<<9; // 32-cell mode
 		nametab_step = 1<<5;
+		if (!(PicoIn.opt&POPT_DIS_32C_BORDER))
+			scrpos += 32;
 	}
 	nametab += nametab_step*start;
 
@@ -240,6 +242,8 @@ static void DrawLayerFull(int plane, int *hcache, int planestart, int planeend,
 	else          nametab=(pvid->reg[4]&0x07)<<12; // B
 
 	scrpos = est->Draw2FB;
+	if (!(pvid->reg[12]&1) && !(PicoIn.opt&POPT_DIS_32C_BORDER))
+		scrpos += 32;
 	scrpos+=8*LINE_WIDTH*(planestart-START_ROW);
 
 	// Get vertical scroll value:
@@ -315,6 +319,8 @@ static void DrawTilesFromCacheF(int *hc, struct PicoEState *est)
 	short blank=-1; // The tile we know is blank
 	unsigned char *scrpos = est->Draw2FB, *pd = 0;
 
+	if (!(Pico.video.reg[12]&1) && !(PicoIn.opt&POPT_DIS_32C_BORDER))
+		scrpos += 32;
 	// *hcache++ = code|(dx<<16)|(trow<<27); // cache it
 	scrpos+=(*hc++)*LINE_WIDTH - START_ROW*LINE_WIDTH*8;
 
@@ -377,6 +383,8 @@ static void DrawSpriteFull(unsigned int *sprite, struct PicoEState *est)
 	while(sy <= START_ROW*8) { sy+=8; tile+=tdeltay; height--; }
 
 	scrpos = est->Draw2FB;
+	if (!(Pico.video.reg[12]&1) && !(PicoIn.opt&POPT_DIS_32C_BORDER))
+		scrpos += 32;
 	scrpos+=(sy-START_ROW*8)*LINE_WIDTH;
 
 	for (; height > 0; height--, sy+=8, tile+=tdeltay)
@@ -412,12 +420,13 @@ static void DrawAllSpritesFull(int prio, int maxwidth)
 	int i,u,link=0;
 	unsigned int *sprites[80]; // Sprites
 	int y_min=START_ROW*8, y_max=END_ROW*8; // for a simple sprite masking
+	int max_sprites = Pico.video.reg[12]&1 ? 80 : 64;
 
 	table=pvid->reg[5]&0x7f;
 	if (pvid->reg[12]&1) table&=0x7e; // Lowest bit 0 in 40-cell mode
 	table<<=8; // Get sprite table address/2
 
-	for (i=u=0; u < 80; u++)
+	for (i = u = 0; u < max_sprites && link < max_sprites; u++)
 	{
 		unsigned int *sprite=NULL;
 		int code, code2, sx, sy, height;
@@ -501,6 +510,11 @@ static void DrawDisplayFull(void)
 	} else {
 		maxw = 264; maxcolc = 32;
 	}
+
+	// 32C border for centering? (for asm)
+	est->rendstatus &= ~PDRAW_BORDER_32;
+	if ((est->rendstatus&PDRAW_32_COLS) && !(PicoIn.opt&POPT_DIS_32C_BORDER))
+		est->rendstatus |= PDRAW_BORDER_32;
 
 	// horizontal window?
 	if ((win=pvid->reg[0x12]))

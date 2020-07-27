@@ -46,8 +46,8 @@ static void vdp_data_write(unsigned char d)
   struct PicoVideo *pv = &Pico.video;
 
   if (pv->type == 3) {
+    if (PicoMem.cram[pv->addr & 0x1f] != d) Pico.m.dirtyPal = 1;
     PicoMem.cram[pv->addr & 0x1f] = d;
-    Pico.m.dirtyPal = 1;
   } else {
     PicoMem.vramb[pv->addr] = d;
   }
@@ -152,7 +152,7 @@ static void z80_sms_out(unsigned short a, unsigned char d)
 
     case 0x40:
     case 0x41:
-      if ((d & 0x90) == 0x90 && Pico.snd.psg_line < Pico.m.scanline)
+      if ((d & 0x90) == 0x90)
         PsndDoPSG(Pico.m.scanline);
       SN76496Write(d);
       break;
@@ -320,16 +320,12 @@ void PicoFrameMS(void)
       }
     }
 
-    // 224 because of how it's done for MD...
-    if (y == 224 && PicoIn.sndOut)
-      PsndGetSamplesMS();
-
     cycles_aim += cycles_line;
     cycles_done += z80_run((cycles_aim - cycles_done) >> 8) << 8;
   }
 
-  if (PicoIn.sndOut && Pico.snd.psg_line < lines)
-    PsndDoPSG(lines - 1);
+  if (PicoIn.sndOut)
+    PsndGetSamplesMS(lines);
 }
 
 void PicoFrameDrawOnlyMS(void)

@@ -9,6 +9,8 @@ asm_render = 0
 asm_ym2612 = 0
 asm_misc = 0
 asm_cdmemory = 0
+asm_32xdraw = 0
+asm_32xmemory = 0
 asm_mix = 0
 endif
 
@@ -40,6 +42,10 @@ ifeq "$(pprof)" "1"
 DEFINES += PPROF
 SRCS_COMMON += $(R)platform/linux/pprof.c
 endif
+ifeq "$(gperf)" "1"
+DEFINES += GPERF
+LDFLAGS += -lprofiler -lstdc++
+endif
 
 # ARM asm stuff
 ifeq "$(ARCH)" "arm"
@@ -53,7 +59,7 @@ SRCS_COMMON += $(R)pico/memory_arm.S
 endif
 ifeq "$(asm_ym2612)" "1"
 DEFINES += _ASM_YM2612_C
-SRCS_COMMON += $(R)pico/sound/ym2612_arm.s
+SRCS_COMMON += $(R)pico/sound/ym2612_arm.S
 endif
 ifeq "$(asm_misc)" "1"
 DEFINES += _ASM_MISC_C
@@ -66,7 +72,11 @@ SRCS_COMMON += $(R)pico/cd/memory_arm.S
 endif
 ifeq "$(asm_32xdraw)" "1"
 DEFINES += _ASM_32X_DRAW
-SRCS_COMMON += $(R)pico/32x/draw_arm.s
+SRCS_COMMON += $(R)pico/32x/draw_arm.S
+endif
+ifeq "$(asm_32xmemory)" "1"
+DEFINES += _ASM_32X_MEMORY_C
+SRCS_COMMON += $(R)pico/32x/memory_arm.S
 endif
 ifeq "$(asm_mix)" "1"
 SRCS_COMMON += $(R)pico/sound/mix_arm.S
@@ -138,7 +148,7 @@ endif
 # --- Z80 ---
 ifeq "$(use_drz80)" "1"
 DEFINES += _USE_DRZ80
-SRCS_COMMON += $(R)cpu/DrZ80/drz80.s
+SRCS_COMMON += $(R)cpu/DrZ80/drz80.S
 endif
 #
 ifeq "$(use_cz80)" "1"
@@ -157,8 +167,16 @@ SRCS_COMMON += $(R)cpu/sh2/compiler.c
 ifdef drc_debug
 DEFINES += DRC_DEBUG=$(drc_debug)
 SRCS_COMMON += $(R)cpu/sh2/mame/sh2dasm.c
-SRCS_COMMON += $(R)platform/libpicofe/linux/host_dasm.c
-LDFLAGS += -lbfd -lopcodes -liberty
+DASM = $(R)platform/libpicofe/linux/host_dasm.c
+DASMLIBS = -lbfd -lopcodes -liberty
+ifeq ("$(ARCH)",$(filter "$(ARCH)","arm" "mipsel"))
+ifeq ($(filter_out $(shell $(CC) --print-file-name=libbfd.so),"/"),)
+DASM = $(R)platform/common/host_dasm.c
+DASMLIBS =
+endif
+endif
+SRCS_COMMON += $(DASM)
+LDFLAGS += $(DASMLIBS)
 endif
 endif # use_sh2drc
 SRCS_COMMON += $(R)cpu/sh2/mame/sh2pico.c
@@ -181,7 +199,7 @@ $(FR)cpu/cyclone/Cyclone.h:
 
 $(FR)cpu/cyclone/Cyclone.s: $(FR)cpu/$(CYCLONE_CONFIG)
 	@echo building Cyclone...
-	@make CC=$(CYCLONE_CC) CXX=$(CYCLONE_CXX) -C $(R)cpu/cyclone/ CONFIG_FILE=../$(CYCLONE_CONFIG)
+	@make CC=$(CYCLONE_CC) CXX=$(CYCLONE_CXX) -C $(R)cpu/cyclone/ CONFIG_FILE=../$(CYCLONE_CONFIG) HAVE_ARMv6=$(HAVE_ARMv6)
 
 $(FR)cpu/cyclone/Cyclone.s: $(FR)cpu/cyclone/*.cpp $(FR)cpu/cyclone/*.h
 

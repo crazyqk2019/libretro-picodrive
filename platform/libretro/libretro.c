@@ -116,6 +116,8 @@ static short ALIGNED(4) sndBuffer[2*INITIAL_SND_RATE/50];
 
 static void snd_write(int len);
 
+char **g_argv;
+
 #ifdef _WIN32
 #define SLASH '\\'
 #else
@@ -533,10 +535,6 @@ void emu_video_mode_change(int start_line, int line_count, int is_32cols)
    memset(vout_buf, 0, vout_width * VOUT_MAX_HEIGHT);
    memset(retro_palette, 0, gsKit_texture_size_ee(16, 16, GS_PSM_CT16));
    PicoDrawSetOutBuf(vout_buf, vout_width);
-
-   if (ps2) {
-      ps2->clearTexture = true;
-   }
 #else
    vout_width = is_32cols ? VOUT_32BIT_WIDTH : VOUT_MAX_WIDTH;
    memset(vout_buf, 0, VOUT_MAX_WIDTH * VOUT_MAX_HEIGHT * 2);  
@@ -569,6 +567,8 @@ void emu_video_mode_change(int start_line, int line_count, int is_32cols)
 
 void emu_32x_startup(void)
 {
+   PicoDrawSetOutFormat(PDF_RGB555, 0);
+   PicoDrawSetOutBuf(vout_buf, vout_width * 2);
 }
 
 void lprintf(const char *fmt, ...)
@@ -1548,7 +1548,6 @@ void retro_run(void)
       }
 
       Pico.m.dirtyPal = 0;
-      ps2->updatedPalette = true;
    }
 
    if (PicoIn.AHW & PAHW_SMS) {

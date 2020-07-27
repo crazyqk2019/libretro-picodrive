@@ -1,6 +1,7 @@
 /*
  * PicoDrive
  * (C) notaz, 2009,2010
+ * (C) kub, 2019
  *
  * This work is licensed under the terms of MAME license.
  * See COPYING file in the top-level directory.
@@ -10,6 +11,9 @@
 int (*PicoScan32xBegin)(unsigned int num);
 int (*PicoScan32xEnd)(unsigned int num);
 int Pico32xDrawMode;
+
+void *DrawLineDestBase32x;
+int DrawLineDestIncrement32x;
 
 static void convert_pal555(int invert_prio)
 {
@@ -44,16 +48,21 @@ static void convert_pal555(int invert_prio)
   const unsigned int m1 = 0x001f;                                 \
   const unsigned int m2 = 0x03e0;                                 \
   const unsigned int m3 = 0x7c00;                                 \
-  int i;                                                          \
+  unsigned short t;                                               \
+  int i = 320;                                                    \
                                                                   \
-  for (i = 320; i > 0; i--, pd++, p32x++, pmd++) {                \
-    unsigned short t = *p32x;                                     \
-    if ((*pmd & 0x3f) != mdbg && !((t ^ inv) & 0x8000)) {         \
-      pmd_draw_code;                                              \
-      continue;                                                   \
+  while (i > 0) {                                                 \
+    for (; i > 0 && (*pmd & 0x3f) == mdbg; pd++, pmd++, i--) {    \
+      t = *p32x++;                                                \
+      *pd = ((t&m1) << 11) | ((t&m2) << 1) | ((t&m3) >> 10);      \
     }                                                             \
-                                                                  \
-    *pd = ((t & m1) << 11) | ((t & m2) << 1) | ((t & m3) >> 10);  \
+    for (; i > 0 && (*pmd & 0x3f) != mdbg; pd++, pmd++, i--) {    \
+      t = *p32x++;                                                \
+      if ((t ^ inv) & 0x8000)                                     \
+        *pd = ((t&m1) << 11) | ((t&m2) << 1) | ((t&m3) >> 10);    \
+      else                                                        \
+        pmd_draw_code;                                            \
+    }                                                             \
   }                                                               \
 }
 
@@ -61,15 +70,21 @@ static void convert_pal555(int invert_prio)
 #define do_line_pp(pd, p32x, pmd, pmd_draw_code)                  \
 {                                                                 \
   unsigned short t;                                               \
-  int i;                                                          \
-  for (i = 320; i > 0; i--, pd++, p32x++, pmd++) {                \
-    t = pal[*(unsigned char *)((uintptr_t)p32x ^ 1)];             \
-    if ((t & 0x20) || (*pmd & 0x3f) == mdbg)                      \
+  int i = 320;                                                    \
+  while (i > 0) {                                                 \
+    for (; i > 0 && (*pmd & 0x3f) == mdbg; pd++, pmd++, i--) {    \
+      t = pal[*(unsigned char *)((uintptr_t)(p32x++) ^ 1)];       \
       *pd = t;                                                    \
-    else                                                          \
-      pmd_draw_code;                                              \
+    }                                                             \
+    for (; i > 0 && (*pmd & 0x3f) != mdbg; pd++, pmd++, i--) {    \
+      t = pal[*(unsigned char *)((uintptr_t)(p32x++) ^ 1)];       \
+      if (t & 0x20)                                               \
+        *pd = t;                                                  \
+      else                                                        \
+        pmd_draw_code;                                            \
+    }                                                             \
   }                                                               \
-} 
+}
 
 // run length mode
 #define do_line_rl(pd, p32x, pmd, pmd_draw_code)                  \
@@ -233,13 +248,11 @@ void PicoDraw32xLayer(int offs, int lines, int md_bg)
   int lines_sft_offs;
   int which_func;
 
-  Pico.est.DrawLineDest = (char *)DrawLineDestBase + offs * DrawLineDestIncrement;
+  Pico.est.DrawLineDest = (char *)DrawLineDestBase32x + offs * DrawLineDestIncrement32x;
   dram = Pico32xMem->dram[Pico32x.vdp_regs[0x0a/2] & P32XV_FS];
 
-  if (Pico32xDrawMode == PDM32X_BOTH) {
-    if (Pico.m.dirtyPal)
-      PicoDrawUpdateHighPal();
-  }
+  if (Pico32xDrawMode == PDM32X_BOTH)
+    PicoDrawUpdateHighPal();
 
   if ((Pico32x.vdp_regs[0] & P32XV_Mx) == 2)
   {
@@ -278,20 +291,21 @@ do_it:
 void PicoDraw32xLayerMdOnly(int offs, int lines)
 {
   int have_scan = PicoScan32xBegin != NULL && PicoScan32xEnd != NULL;
-  unsigned short *dst = (void *)((char *)DrawLineDestBase + offs * DrawLineDestIncrement);
+  unsigned short *dst = (void *)((char *)DrawLineDestBase32x + offs * DrawLineDestIncrement32x);
   unsigned char  *pmd = Pico.est.Draw2FB + 328 * offs + 8;
   unsigned short *pal = Pico.est.HighPal;
   int poffs = 0, plen = 320;
   int l, p;
 
   if (!(Pico.video.reg[12] & 1)) {
-    // 32col mode
+    // 32col mode. for some render modes MD pixel data carries an offset
+    if (!(PicoIn.opt & (POPT_ALT_RENDERER|POPT_DIS_32C_BORDER)))
+      pmd += 32;
     poffs = 32;
     plen = 256;
   }
 
-  if (Pico.m.dirtyPal)
-    PicoDrawUpdateHighPal();
+  PicoDrawUpdateHighPal();
 
   dst += poffs;
   for (l = 0; l < lines; l++) {
@@ -305,7 +319,7 @@ void PicoDraw32xLayerMdOnly(int offs, int lines)
       dst[p + 2] = pal[*pmd++];
       dst[p + 3] = pal[*pmd++];
     }
-    dst = (void *)((char *)dst + DrawLineDestIncrement);
+    dst = (void *)((char *)dst + DrawLineDestIncrement32x);
     pmd += 328 - plen;
     if (have_scan)
       PicoScan32xEnd(l + offs);
@@ -314,21 +328,32 @@ void PicoDraw32xLayerMdOnly(int offs, int lines)
 
 void PicoDrawSetOutFormat32x(pdso_t which, int use_32x_line_mode)
 {
-#ifdef _ASM_32X_DRAW
-  extern void *Pico32xNativePal;
-  Pico32xNativePal = Pico32xMem->pal_native;
-#endif
-
-  if (which == PDF_RGB555 && use_32x_line_mode) {
-    // we'll draw via FinalizeLine32xRGB555 (rare)
+  if (which == PDF_RGB555) {
+    // need CLUT pixels in PicoDraw2FB for layer transparency
+    PicoDrawSetInternalBuf(Pico.est.Draw2FB, 328);
+    PicoDrawSetOutBufMD(DrawLineDestBase32x, DrawLineDestIncrement32x);
+  } else {
+    // use the same layout as alt renderer
     PicoDrawSetInternalBuf(NULL, 0);
-    Pico32xDrawMode = PDM32X_OFF;
-    return;
+    PicoDrawSetOutBufMD(Pico.est.Draw2FB + 8, 328);
   }
 
-  // use the same layout as alt renderer
-  PicoDrawSetInternalBuf(Pico.est.Draw2FB, 328);
-  Pico32xDrawMode = (which == PDF_RGB555) ? PDM32X_32X_ONLY : PDM32X_BOTH;
+  if (use_32x_line_mode)
+    // we'll draw via FinalizeLine32xRGB555 (rare)
+    Pico32xDrawMode = PDM32X_OFF;
+  else
+    // in RGB555 mode the 32x layer is drawn over the MD layer, in the other
+    // modes 32x and MD layer are merged together by the 32x renderer
+    Pico32xDrawMode = (which == PDF_RGB555) ? PDM32X_32X_ONLY : PDM32X_BOTH;
+}
+
+void PicoDrawSetOutBuf32X(void *dest, int increment)
+{
+  DrawLineDestBase32x = dest;
+  DrawLineDestIncrement32x = increment;
+  // in RGB555 mode this buffer is also used by the MD renderer
+  if (Pico32xDrawMode != PDM32X_BOTH)
+    PicoDrawSetOutBufMD(DrawLineDestBase32x, DrawLineDestIncrement32x);
 }
 
 // vim:shiftwidth=2:ts=2:expandtab

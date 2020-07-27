@@ -14,6 +14,7 @@
 #include "cz80.h"
 
 #if PICODRIVE_HACKS
+#include <pico/pico_int.h>
 #include <pico/memory.h>
 #endif
 
@@ -277,7 +278,8 @@ Cz80_Check_Interrupt:
 				CPU->ICount -= CPU->ExtraCycles;
 				CPU->ExtraCycles = 0;
 			}
-			goto Cz80_Exec;
+			if (!CPU->HaltState)
+				goto Cz80_Exec;
 		}
 	}
 	else CPU->ICount = 0;
@@ -287,6 +289,8 @@ Cz80_Exec_End:
 #if CZ80_ENCRYPTED_ROM
 	CPU->OPBase = OPBase;
 #endif
+	if (CPU->HaltState)
+		CPU->ICount = 0;
 	cycles -= CPU->ICount;
 #if !CZ80_EMULATE_R_EXACTLY
 	zR = (zR + (cycles >> 2)) & 0x7f;

@@ -121,7 +121,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
-			opcode = RW(sh2, sh2->delay);
+			opcode = (UINT32)(UINT16)RW(sh2, sh2->delay);
 
 			// TODO: more branch types
 			if ((opcode >> 13) == 5) { // BRA/BSR
@@ -139,7 +139,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		else
 		{
 			sh2->ppc = sh2->pc;
-			opcode = RW(sh2, sh2->pc);
+			opcode = (UINT32)(UINT16)RW(sh2, sh2->pc);
 		}
 
 		sh2->delay = 0;
@@ -214,7 +214,7 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 			if (sh2->pc < *base_pc || sh2->pc >= *end_pc) {
 				*base_pc = sh2->pc;
 				scan_block(*base_pc, sh2->is_slave,
-					op_flags, end_pc, NULL);
+					op_flags, end_pc, NULL, NULL);
 			}
 			if ((op_flags[(sh2->pc - *base_pc) / 2]
 				& OF_BTARGET) || sh2->pc == *base_pc
@@ -232,13 +232,13 @@ int sh2_execute_interpreter(SH2 *sh2, int cycles)
 		if (sh2->delay)
 		{
 			sh2->ppc = sh2->delay;
-			opcode = RW(sh2, sh2->delay);
+			opcode = (UINT32)(UINT16)RW(sh2, sh2->delay);
 			sh2->pc -= 2;
 		}
 		else
 		{
 			sh2->ppc = sh2->pc;
-			opcode = RW(sh2, sh2->pc);
+			opcode = (UINT32)(UINT16)RW(sh2, sh2->pc);
 		}
 
 		sh2->delay = 0;

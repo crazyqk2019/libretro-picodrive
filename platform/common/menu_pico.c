@@ -499,6 +499,7 @@ static menu_entry e_menu_adv_options[] =
 	mee_range_h   ("Overclock M68k (%)",       MA_OPT2_OVERCLOCK_M68K,currentConfig.overclock_68k, 0, 1000, h_ovrclk),
 	mee_onoff     ("Emulate Z80",              MA_OPT2_ENABLE_Z80,    PicoIn.opt, POPT_EN_Z80),
 	mee_onoff     ("Emulate YM2612 (FM)",      MA_OPT2_ENABLE_YM2612, PicoIn.opt, POPT_EN_FM),
+	mee_onoff     ("Disable YM2612 SSG-EG",    MA_OPT2_DISABLE_YM_SSG,PicoIn.opt, POPT_DIS_FM_SSGEG),
 	mee_onoff     ("Emulate SN76496 (PSG)",    MA_OPT2_ENABLE_SN76496,PicoIn.opt, POPT_EN_PSG),
 	mee_onoff     ("gzip savestates",          MA_OPT2_GZIP_STATES,   currentConfig.EmuOpt, EOPT_GZIP_SAVES),
 	mee_onoff     ("Don't save last used ROM", MA_OPT2_NO_LAST_ROM,   currentConfig.EmuOpt, EOPT_NO_AUTOSVCFG),
@@ -506,6 +507,8 @@ static menu_entry e_menu_adv_options[] =
 	mee_onoff     ("Disable frame limiter",    MA_OPT2_NO_FRAME_LIMIT,currentConfig.EmuOpt, EOPT_NO_FRMLIMIT),
 	mee_onoff     ("Enable dynarecs",          MA_OPT2_DYNARECS,      PicoIn.opt, POPT_EN_DRC),
 	mee_onoff     ("Status line in main menu", MA_OPT2_STATUS_LINE,   currentConfig.EmuOpt, EOPT_SHOW_RTC),
+	mee_range     ("Max auto frameskip",       MA_OPT2_MAX_FRAMESKIP, currentConfig.max_skip, 1, 10),
+	mee_onoff     ("PWM IRQ optimization",     MA_OPT2_PWM_IRQ_OPT,   PicoIn.opt, POPT_PWM_IRQ_OPT),
 	MENU_OPTIONS_ADV
 	mee_end,
 };
@@ -920,7 +923,8 @@ static void draw_frame_credits(void)
 }
 
 static const char credits[] =
-	"PicoDrive v" VERSION " (c) notaz, 2006-2013\n\n\n"
+	"PicoDrive v" VERSION "\n"
+	"(c) notaz, 2006-2013; irixxxx, 2018-2020\n\n"
 	"Credits:\n"
 	"fDave: initial code\n"
 #ifdef EMU_C68K
@@ -936,6 +940,7 @@ static const char credits[] =
 	"MAME devs: SH2, YM2612 and SN76496 cores\n"
 	"Eke, Stef: some Sega CD code\n"
 	"Inder, ketchupgun: graphics\n"
+	"Irixxxx: SH2 drc improvements\n"
 #ifdef __GP2X__
 	"Squidge: mmuhack\n"
 	"Dzz: ARM940 sample\n"

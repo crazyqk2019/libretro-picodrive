@@ -43,6 +43,12 @@ char *PDebugMain(void)
     !!(Pico.sv.flags & SRF_ENABLED), !!(Pico.sv.flags & SRF_EEPROM), Pico.sv.eeprom_type); MVP;
   sprintf(dstrp, "sram range: %06x-%06x, reg: %02x\n", Pico.sv.start, Pico.sv.end, Pico.m.sram_reg); MVP;
   sprintf(dstrp, "pend int: v:%i, h:%i, vdp status: %04x\n", bit(pv->pending_ints,5), bit(pv->pending_ints,4), pv->status); MVP;
+  sprintf(dstrp, "VDP regs 00-07: %02x %02x %02x %02x %02x %02x %02x %02x\n",reg[0],reg[1],reg[2],reg[3],reg[4],reg[5],reg[6],reg[7]); MVP;
+  sprintf(dstrp, "VDP regs 08-0f: %02x %02x %02x %02x %02x %02x %02x %02x\n",reg[8],reg[9],reg[10],reg[11],reg[12],reg[13],reg[14],reg[15]); MVP;
+  sprintf(dstrp, "VDP regs 10-17: %02x %02x %02x %02x %02x %02x %02x %02x\n",reg[16],reg[17],reg[18],reg[19],reg[20],reg[21],reg[22],reg[23]); MVP;
+  sprintf(dstrp, "VDP regs 18-1f: %02x %02x %02x %02x %02x %02x %02x %02x\n",reg[24],reg[25],reg[26],reg[27],reg[28],reg[29],reg[30],reg[31]); MVP;
+  r = (reg[5]<<9)+(reg[6]<<11);
+  sprintf(dstrp, "sprite #0: %04x %04x %04x %04x\n",PicoMem.vram[r/2],PicoMem.vram[r/2+1],PicoMem.vram[r/2+2],PicoMem.vram[r/2+3]); MVP;
   sprintf(dstrp, "pal: %i, hw: %02x, frame#: %i, cycles: %u\n", Pico.m.pal, Pico.m.hardware, Pico.m.frame_count, SekCyclesDone()); MVP;
   sprintf(dstrp, "M68k: PC: %06x, SR: %04x, irql: %i\n", SekPc, SekSr, SekIrqLevel); MVP;
   for (r = 0; r < 8; r++) {
@@ -369,42 +375,32 @@ void PDebugDumpMem(void)
 
 void PDebugZ80Frame(void)
 {
-  int lines, line_sample;
+  int lines;
 
   if (PicoIn.AHW & PAHW_SMS)
     return;
 
-  if (Pico.m.pal) {
+  if (Pico.m.pal)
     lines = 313;
-    line_sample = 68;
-  } else {
+  else
     lines = 262;
-    line_sample = 93;
-  }
 
   z80_resetCycles();
   PsndStartFrame();
-
-  if (/*Pico.m.z80Run &&*/ !Pico.m.z80_reset && (PicoIn.opt&POPT_EN_Z80))
-    PicoSyncZ80(Pico.t.m68c_cnt + line_sample * 488);
-  if (PicoIn.sndOut)
-    PsndGetSamples(line_sample);
 
   if (/*Pico.m.z80Run &&*/ !Pico.m.z80_reset && (PicoIn.opt&POPT_EN_Z80)) {
     PicoSyncZ80(Pico.t.m68c_cnt + 224 * 488);
     z80_int();
   }
-  if (PicoIn.sndOut)
-    PsndGetSamples(224);
 
   // sync z80
   if (/*Pico.m.z80Run &&*/ !Pico.m.z80_reset && (PicoIn.opt&POPT_EN_Z80)) {
     Pico.t.m68c_cnt += Pico.m.pal ? 151809 : 127671; // cycles adjusted for converter
     PicoSyncZ80(Pico.t.m68c_cnt);
   }
-  if (PicoIn.sndOut && ym2612.dacen && Pico.snd.dac_line < lines)
-    PsndDoDAC(lines - 1);
-  PsndDoPSG(lines - 1);
+
+  if (PicoIn.sndOut)
+    PsndGetSamples(lines);
 
   timers_cycle();
   Pico.t.m68c_aim = Pico.t.m68c_cnt;
