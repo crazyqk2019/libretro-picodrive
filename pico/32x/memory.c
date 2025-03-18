@@ -1,7 +1,7 @@
 /*
  * PicoDrive
  * (C) notaz, 2009,2010,2013
- * (C) kub, 2019
+ * (C) irixxxx, 2019-2024
  *
  * This work is licensed under the terms of MAME license.
  * See COPYING file in the top-level directory.
@@ -42,7 +42,7 @@
 #include "../pico_int.h"
 #include "../memory.h"
 
-#include "../../cpu/sh2/compiler.h"
+#include <cpu/sh2/compiler.h>
 DRC_DECLARE_SR;
 
 static const char str_mars[] = "MARS";
@@ -56,10 +56,10 @@ static void (*m68k_write8_io)(u32 a, u32 d);
 static void (*m68k_write16_io)(u32 a, u32 d);
 
 // addressing byte in 16bit reg
-#define REG8IN16(ptr, offs) ((u8 *)ptr)[(offs) ^ 1]
+#define REG8IN16(ptr, offs) ((u8 *)ptr)[MEM_BE2(offs)]
 
 // poll detection
-#define POLL_THRESHOLD 5
+#define POLL_THRESHOLD 11  // Primal Rage speed, Blackthorne intro
 
 static struct {
   u32 addr1, addr2, cycles;
@@ -70,9 +70,9 @@ static int m68k_poll_detect(u32 a, u32 cycles, u32 flags)
 {
   int ret = 0;
   // support polling on 2 addresses - seen in Wolfenstein
-  int match = (a - m68k_poll.addr1 <= 2 || a - m68k_poll.addr2 <= 2);
+  int match = (a - m68k_poll.addr1 <= 3 || a - m68k_poll.addr2 <= 3);
 
-  if (match && cycles - m68k_poll.cycles <= 64 && !SekNotPolling)
+  if (match && CYCLES_GT(64, cycles - m68k_poll.cycles) && !SekNotPolling)
   {
     // detect split 32bit access by same cycle count, and ignore those
     if (cycles != m68k_poll.cycles && ++m68k_poll.cnt >= POLL_THRESHOLD) {
@@ -91,7 +91,7 @@ static int m68k_poll_detect(u32 a, u32 cycles, u32 flags)
     m68k_poll.cnt = 0;
     if (!match) {
       m68k_poll.addr2 = m68k_poll.addr1;
-      m68k_poll.addr1 = a;
+      m68k_poll.addr1 = a & ~1;
     }
     SekNotPolling = 0;
   }
@@ -100,15 +100,19 @@ static int m68k_poll_detect(u32 a, u32 cycles, u32 flags)
   return ret;
 }
 
-void p32x_m68k_poll_event(u32 flags)
+void p32x_m68k_poll_event(u32 a, u32 flags)
 {
-  if (Pico32x.emu_flags & flags) {
+  int match = (a - m68k_poll.addr1 <= 3 || a - m68k_poll.addr2 <= 3);
+
+  if ((Pico32x.emu_flags & flags) && match) {
     elprintf(EL_32X, "m68k poll %02x -> %02x", Pico32x.emu_flags,
       Pico32x.emu_flags & ~flags);
     Pico32x.emu_flags &= ~flags;
     SekSetStop(0);
   }
-  m68k_poll.addr1 = m68k_poll.addr2 = m68k_poll.cnt = 0;
+
+  if (!(Pico32x.emu_flags & (P32XF_68KCPOLL|P32XF_68KVPOLL)))
+    m68k_poll.addr1 = m68k_poll.addr2 = m68k_poll.cnt = 0;
 }
 
 void NOINLINE p32x_sh2_poll_detect(u32 a, SH2 *sh2, u32 flags, int maxcnt)
@@ -116,17 +120,19 @@ void NOINLINE p32x_sh2_poll_detect(u32 a, SH2 *sh2, u32 flags, int maxcnt)
   u32 cycles_done = sh2_cycles_done_t(sh2);
   u32 cycles_diff = cycles_done - sh2->poll_cycles;
 
+  a &= ~0x20000000;
   // reading 2 consecutive 16bit values is probably a 32bit access. detect this
   // by checking address (max 2 bytes away) and cycles (max 2 cycles later).
   // no polling if more than 20 cycles have passed since last detect call.
-  if (a - sh2->poll_addr <= 2 && CYCLES_GE(20, cycles_diff)) {
-    if (CYCLES_GT(cycles_diff, 2) && ++sh2->poll_cnt >= maxcnt) {
+  if (a - sh2->poll_addr <= 3 && CYCLES_GE(20, cycles_diff)) {
+    if (!sh2_not_polling(sh2) && CYCLES_GT(cycles_diff, 2) &&
+                ++sh2->poll_cnt >= maxcnt) {
       if (!(sh2->state & flags))
         elprintf_sh2(sh2, EL_32X, "state: %02x->%02x",
           sh2->state, sh2->state | flags);
 
       sh2->state |= flags;
-      sh2_end_run(sh2, 1);
+      sh2_end_run(sh2, 0);
       pevt_log_sh2(sh2, EVT_POLL_START);
 #ifdef DRC_SH2
       // mark this as an address used for polling if SDRAM
@@ -141,18 +147,20 @@ void NOINLINE p32x_sh2_poll_detect(u32 a, SH2 *sh2, u32 flags, int maxcnt)
   }
   else if (!(sh2->state & (SH2_STATE_CPOLL|SH2_STATE_VPOLL|SH2_STATE_RPOLL))) {
     sh2->poll_cnt = 0;
-    sh2->poll_addr = a;
+    sh2->poll_addr = a & ~1;
   }
   sh2->poll_cycles = cycles_done;
+  sh2_set_polling(sh2);
 }
 
-void NOINLINE p32x_sh2_poll_event(SH2 *sh2, u32 flags, u32 m68k_cycles)
+void NOINLINE p32x_sh2_poll_event(u32 a, SH2 *sh2, u32 flags, u32 m68k_cycles)
 {
-  if (sh2->state & flags) {
+  a &= ~0x20000000;
+  if ((sh2->state & flags) && a - sh2->poll_addr <= 3) {
     elprintf_sh2(sh2, EL_32X, "state: %02x->%02x", sh2->state,
       sh2->state & ~flags);
 
-    if (sh2->m68krcycles_done < m68k_cycles && !(sh2->state & SH2_STATE_RUN))
+    if (CYCLES_GT(m68k_cycles, sh2->m68krcycles_done) && !(sh2->state & SH2_STATE_RUN))
       sh2->m68krcycles_done = m68k_cycles;
 
     pevt_log_sh2_o(sh2, EVT_POLL_END);
@@ -163,7 +171,7 @@ void NOINLINE p32x_sh2_poll_event(SH2 *sh2, u32 flags, u32 m68k_cycles)
     sh2->poll_addr = sh2->poll_cycles = sh2->poll_cnt = 0;
 }
 
-static void sh2s_sync_on_read(SH2 *sh2, unsigned cycles)
+static NOINLINE void sh2s_sync_on_read(SH2 *sh2, unsigned cycles)
 {
   if (sh2->poll_cnt != 0)
     return;
@@ -201,7 +209,7 @@ static NOINLINE u32 sh2_poll_read(u32 a, u32 d, unsigned int cycles, SH2* sh2)
     idx = (idx+1) % PFIFO_SZ;
 
     if (cpu != p->cpu) {
-      if (CYCLES_GT(cycles, p->cycles+80)) {
+      if (CYCLES_GT(cycles, p->cycles+60)) { // ~180 sh2 cycles, Spiderman
         // drop older fifo stores that may cause synchronisation problems.
         p->a = -1;
       } else if (p->a == a) {
@@ -276,7 +284,7 @@ u32 REGPARM(3) p32x_sh2_poll_memory16(u32 a, u32 d, SH2 *sh2)
     d = (s16)sh2_poll_read(a, d, cycles, sh2);
   }
 
-  p32x_sh2_poll_detect(a, sh2, SH2_STATE_RPOLL, 5);
+  p32x_sh2_poll_detect(a, sh2, SH2_STATE_RPOLL, 7);
 
   DRC_RESTORE_SR(sh2);
   return d;
@@ -297,7 +305,7 @@ u32 REGPARM(3) p32x_sh2_poll_memory32(u32 a, u32 d, SH2 *sh2)
         ((u16)sh2_poll_read(a+2, d, cycles, sh2));
   }
 
-  p32x_sh2_poll_detect(a, sh2, SH2_STATE_RPOLL, 5);
+  p32x_sh2_poll_detect(a, sh2, SH2_STATE_RPOLL, 7);
 
   DRC_RESTORE_SR(sh2);
   return d;
@@ -324,7 +332,7 @@ static u32 sh2_comm_faker(u32 a)
   static int f = 0;
   if (a == 0x28 && !p32x_csum_faked) {
     p32x_csum_faked = 1;
-    return *(unsigned short *)(Pico.rom + 0x18e);
+    return *(u16 *)(Pico.rom + 0x18e);
   }
   if (f >= sizeof(comm_fakevals) / sizeof(comm_fakevals[0]))
     f = 0;
@@ -349,10 +357,8 @@ static u32 p32x_reg_read16(u32 a)
     if (CYCLES_GT(cycles - msh2.m68krcycles_done, 244))
       p32x_sync_sh2s(cycles);
 
-    if (m68k_poll_detect(a, cycles, P32XF_68KCPOLL)) {
+    if (m68k_poll_detect(a, cycles, P32XF_68KCPOLL))
       SekSetStop(1);
-      SekEndRun(16);
-    }
     return sh2_poll_read(a, Pico32x.regs[a / 2], cycles, NULL);
   }
 #endif
@@ -410,7 +416,10 @@ static void p32x_reg_write8(u32 a, u32 d)
       REG8IN16(r, 0x00) = d & 0x80;
       return;
     case 0x01: // adapter ctl: RES and ADEN writable
-      if ((d ^ r[0]) & d & P32XS_nRES)
+      if ((d ^ r[0]) & ~d & P32XS_ADEN) {
+        d |= P32XS_nRES;
+        Pico32xShutdown();
+      } else if ((d ^ r[0]) & d & P32XS_nRES)
         p32x_reset_sh2s();
       REG8IN16(r, 0x01) &= ~(P32XS_nRES|P32XS_ADEN);
       REG8IN16(r, 0x01) |= d & (P32XS_nRES|P32XS_ADEN);
@@ -511,16 +520,17 @@ static void p32x_reg_write8(u32 a, u32 d)
     case 0x2d:
     case 0x2e:
     case 0x2f:
-      if (REG8IN16(r, a) != d) {
-        unsigned int cycles = SekCyclesDone();
+      { unsigned int cycles = SekCyclesDone();
 
         if (CYCLES_GT(cycles - msh2.m68krcycles_done, 64))
           p32x_sync_sh2s(cycles);
 
-        REG8IN16(r, a) = d;
-        p32x_sh2_poll_event(&sh2s[0], SH2_STATE_CPOLL, cycles);
-        p32x_sh2_poll_event(&sh2s[1], SH2_STATE_CPOLL, cycles);
-        sh2_poll_write(a & ~1, r[a / 2], cycles, NULL);
+        if (REG8IN16(r, a) != (u8)d) {
+          REG8IN16(r, a) = d;
+          p32x_sh2_poll_event(a, &sh2s[0], SH2_STATE_CPOLL, cycles);
+          p32x_sh2_poll_event(a, &sh2s[1], SH2_STATE_CPOLL, cycles);
+          sh2_poll_write(a & ~1, r[a / 2], cycles, NULL);
+        }
       }
       return;
     case 0x30:
@@ -574,7 +584,10 @@ static void p32x_reg_write16(u32 a, u32 d)
 
   switch (a/2) {
     case 0x00/2: // adapter ctl
-      if ((d ^ r[0]) & d & P32XS_nRES)
+      if ((d ^ r[0]) & ~d & P32XS_ADEN) {
+        d |= P32XS_nRES;
+        Pico32xShutdown();
+      } else if ((d ^ r[0]) & d & P32XS_nRES)
         p32x_reset_sh2s();
       r[0] &= ~(P32XS_FM|P32XS_nRES|P32XS_ADEN);
       r[0] |= d & (P32XS_FM|P32XS_nRES|P32XS_ADEN);
@@ -608,16 +621,17 @@ static void p32x_reg_write16(u32 a, u32 d)
     case 0x2a/2:
     case 0x2c/2:
     case 0x2e/2:
-      if (r[a / 2] != d) {
-        unsigned int cycles = SekCyclesDone();
+      { unsigned int cycles = SekCyclesDone();
 
         if (CYCLES_GT(cycles - msh2.m68krcycles_done, 64))
           p32x_sync_sh2s(cycles);
 
-        r[a / 2] = d;
-        p32x_sh2_poll_event(&sh2s[0], SH2_STATE_CPOLL, cycles);
-        p32x_sh2_poll_event(&sh2s[1], SH2_STATE_CPOLL, cycles);
-        sh2_poll_write(a, (u16)d, cycles, NULL);
+        if (r[a / 2] != (u16)d) {
+          r[a / 2] = d;
+          p32x_sh2_poll_event(a, &sh2s[0], SH2_STATE_CPOLL, cycles);
+          p32x_sh2_poll_event(a, &sh2s[1], SH2_STATE_CPOLL, cycles);
+          sh2_poll_write(a, (u16)d, cycles, NULL);
+        }
       }
       return;
     case 0x30/2: // PWM control
@@ -661,7 +675,7 @@ static u32 p32x_vdp_read16(u32 a)
   return d;
 }
 
-static void p32x_vdp_write8(u32 a, u32 d)
+static void p32x_vdp_write8(u32 a, u32 d, SH2 *sh2)
 {
   u16 *r = Pico32x.vdp_regs;
   a &= 0x0f;
@@ -670,23 +684,27 @@ static void p32x_vdp_write8(u32 a, u32 d)
   switch (a) {
     case 0x01:
       // priority inversion is handled in palette
-      if ((r[0] ^ d) & P32XV_PRI)
+      if ((r[0] ^ d) & P32XV_PRI) {
+        Pico32xDrawSync(sh2);
         Pico32x.dirty_pal = 1;
+      }
       r[0] = (r[0] & P32XV_nPAL) | (d & 0xff);
       break;
     case 0x03: // shift (for pp mode)
+      if ((r[2 / 2] ^ d) & P32XV_SFT)
+        Pico32xDrawSync(sh2);
       r[2 / 2] = d & 1;
       break;
     case 0x05: // fill len
       r[4 / 2] = d & 0xff;
       break;
     case 0x0b:
-      d &= 1;
+      d &= P32XV_FS;
       Pico32x.pending_fb = d;
       // if we are blanking and FS bit is changing
       if (((r[0x0a/2] & P32XV_VBLK) || (r[0] & P32XV_Mx) == 0) && ((r[0x0a/2] ^ d) & P32XV_FS)) {
         r[0x0a/2] ^= P32XV_FS;
-        Pico32xSwapDRAM(d ^ 1);
+        Pico32xSwapDRAM(d ^ P32XV_FS);
         elprintf(EL_32X, "VDP FS: %d", r[0x0a/2] & P32XV_FS);
       }
       break;
@@ -719,7 +737,7 @@ static void p32x_vdp_write16(u32 a, u32 d, SH2 *sh2)
     return;
   }
 
-  p32x_vdp_write8(a | 1, d);
+  p32x_vdp_write8(a | 1, d, sh2);
 }
 
 // ------------------------------------------------------------------
@@ -736,7 +754,7 @@ static u32 p32x_sh2reg_read16(u32 a, SH2 *sh2)
       return (r[0] & P32XS_FM) | Pico32x.sh2_regs[0]
         | Pico32x.sh2irq_mask[sh2->is_slave];
     case 0x04/2: // H count (often as comm too)
-      p32x_sh2_poll_detect(a, sh2, SH2_STATE_CPOLL, 9);
+      p32x_sh2_poll_detect(a, sh2, SH2_STATE_CPOLL, 5);
       cycles = sh2_cycles_done_m68k(sh2);
       sh2s_sync_on_read(sh2, cycles);
       return sh2_poll_read(a, Pico32x.sh2_regs[4 / 2], cycles, sh2);
@@ -812,7 +830,7 @@ static void p32x_sh2reg_write8(u32 a, u32 d, SH2 *sh2)
       Pico32x.sh2_regs[0] &= ~0x80;
       Pico32x.sh2_regs[0] |= d & 0x80;
 
-      if ((d ^ old) & 1)
+      if ((old ^ d) & 1)
         p32x_pwm_schedule_sh2(sh2);
       if ((old ^ d) & 2)
         p32x_update_cmd_irq(sh2, 0);
@@ -823,10 +841,10 @@ static void p32x_sh2reg_write8(u32 a, u32 d, SH2 *sh2)
       return;
     case 0x05: // H count
       d &= 0xff;
-      if (Pico32x.sh2_regs[4 / 2] != d) {
+      if (Pico32x.sh2_regs[4 / 2] != (u8)d) {
         unsigned int cycles = sh2_cycles_done_m68k(sh2);
         Pico32x.sh2_regs[4 / 2] = d;
-        p32x_sh2_poll_event(sh2->other_sh2, SH2_STATE_CPOLL, cycles);
+        p32x_sh2_poll_event(a, sh2->other_sh2, SH2_STATE_CPOLL, cycles);
         if (p32x_sh2_ready(sh2->other_sh2, cycles+8))
           sh2_end_run(sh2, 4);
         sh2_poll_write(a & ~1, d, cycles, sh2);
@@ -848,14 +866,14 @@ static void p32x_sh2reg_write8(u32 a, u32 d, SH2 *sh2)
     case 0x2d:
     case 0x2e:
     case 0x2f:
-      if (REG8IN16(r, a) != d) {
+      if (REG8IN16(r, a) != (u8)d) {
         unsigned int cycles = sh2_cycles_done_m68k(sh2);
 
         REG8IN16(r, a) = d;
-        p32x_m68k_poll_event(P32XF_68KCPOLL);
-        p32x_sh2_poll_event(sh2->other_sh2, SH2_STATE_CPOLL, cycles);
+        p32x_m68k_poll_event(a, P32XF_68KCPOLL);
+        p32x_sh2_poll_event(a, sh2->other_sh2, SH2_STATE_CPOLL, cycles);
         if (p32x_sh2_ready(sh2->other_sh2, cycles+8))
-          sh2_end_run(sh2, 1);
+          sh2_end_run(sh2, 0);
         sh2_poll_write(a & ~1, r[a / 2], cycles, sh2);
       }
       return;
@@ -916,7 +934,7 @@ static void p32x_sh2reg_write16(u32 a, u32 d, SH2 *sh2)
       Pico32x.regs[0] |= d & P32XS_FM;
       break;
     case 0x14/2:
-      Pico32x.sh2irqs &= ~P32XI_VRES;
+      Pico32x.sh2irqi[sh2->is_slave] &= ~P32XI_VRES;
       goto irls;
     case 0x16/2:
       Pico32x.sh2irqi[sh2->is_slave] &= ~P32XI_VINT;
@@ -941,14 +959,14 @@ static void p32x_sh2reg_write16(u32 a, u32 d, SH2 *sh2)
     case 0x2a/2:
     case 0x2c/2:
     case 0x2e/2:
-      if (Pico32x.regs[a / 2] != d) {
+      if (Pico32x.regs[a / 2] != (u16)d) {
         unsigned int cycles = sh2_cycles_done_m68k(sh2);
 
         Pico32x.regs[a / 2] = d;
-        p32x_m68k_poll_event(P32XF_68KCPOLL);
-        p32x_sh2_poll_event(sh2->other_sh2, SH2_STATE_CPOLL, cycles);
+        p32x_m68k_poll_event(a, P32XF_68KCPOLL);
+        p32x_sh2_poll_event(a, sh2->other_sh2, SH2_STATE_CPOLL, cycles);
         if (p32x_sh2_ready(sh2->other_sh2, cycles+8))
-          sh2_end_run(sh2, 1);
+          sh2_end_run(sh2, 0);
         sh2_poll_write(a, d, cycles, sh2);
       }
       return;
@@ -1074,14 +1092,16 @@ static void PicoWrite8_32x_on(u32 a, u32 d)
 
   if (!(Pico32x.regs[0] & P32XS_FM)) {
     if ((a & 0xfff0) == 0x5180) { // a15180
-      p32x_vdp_write8(a, d);
+      p32x_vdp_write8(a, d, NULL);
       return;
     }
 
     // TODO: verify
     if ((a & 0xfe00) == 0x5200) { // a15200
       elprintf(EL_32X|EL_ANOMALY, "m68k 32x PAL w8  [%06x]   %02x @%06x", a, d & 0xff, SekPc);
-      ((u8 *)Pico32xMem->pal)[(a & 0x1ff) ^ 1] = d;
+      if (((u8 *)Pico32xMem->pal)[MEM_BE2(a & 0x1ff)] != d)
+        Pico32xDrawSync(NULL);
+      ((u8 *)Pico32xMem->pal)[MEM_BE2(a & 0x1ff)] = d;
       Pico32x.dirty_pal = 1;
       return;
     }
@@ -1133,6 +1153,8 @@ static void PicoWrite16_32x_on(u32 a, u32 d)
     }
 
     if ((a & 0xfe00) == 0x5200) { // a15200
+      if (Pico32xMem->pal[(a & 0x1ff) / 2] != d)
+        Pico32xDrawSync(NULL);
       Pico32xMem->pal[(a & 0x1ff) / 2] = d;
       Pico32x.dirty_pal = 1;
       return;
@@ -1158,11 +1180,9 @@ static void PicoWrite16_32x_on_io_cd(u32 a, u32 d)
 
 static void PicoWrite16_32x_on_io_ssf2(u32 a, u32 d)
 {
-  PicoWrite16_io(a, d);
-  if ((a & ~0x0f) == 0xa130f0) {
-    carthw_ssf2_write8(a + 1, d);
+  carthw_ssf2_write16(a, d);
+  if (a == 0x130f0)
     bank_switch_rom_68k(Pico32x.regs[4 / 2]);
-  }
 }
 
 // before ADEN
@@ -1173,7 +1193,7 @@ u32 PicoRead8_32x(u32 a)
   if (PicoIn.opt & POPT_EN_32X) {
     if ((a & 0xffc0) == 0x5100) { // a15100
       // regs are always readable
-      d = ((u8 *)Pico32x.regs)[(a & 0x3f) ^ 1];
+      d = ((u8 *)Pico32x.regs)[MEM_BE2(a & 0x3f)];
       goto out;
     }
 
@@ -1220,25 +1240,46 @@ void PicoWrite8_32x(u32 a, u32 d)
   if ((PicoIn.opt & POPT_EN_32X) && (a & 0xffc0) == 0x5100) // a15100
   {
     u16 *r = Pico32x.regs;
+    u8 *r8 = (u8 *)r;
 
     elprintf(EL_32X, "m68k 32x w8  [%06x]   %02x @%06x", a, d & 0xff, SekPc);
     a &= 0x3f;
-    if (a == 1) {
-      if ((d ^ r[0]) & d & P32XS_ADEN) {
-        Pico32xStartup();
-        r[0] &= ~P32XS_nRES; // causes reset if specified by this write
-        r[0] |= P32XS_ADEN;
-        p32x_reg_write8(a, d); // forward for reset processing
-      }
-      return;
+    switch (a) {
+      case 0x00:
+        r8[MEM_BE2(a)] = d & (P32XS_FM>>8);
+        return;
+      case 0x01:
+        if ((d ^ r[0]) & d & P32XS_ADEN) {
+          Pico32xStartup();
+          r[0] &= ~P32XS_nRES; // causes reset if specified by this write
+          r[0] |= P32XS_ADEN;
+          p32x_reg_write8(a, d); // forward for reset processing
+        }
+        else {
+          r[0] &= ~(P32XS_nRES|P32XS_ADEN);
+          r[0] |= d & (P32XS_nRES|P32XS_ADEN);
+        }
+        return;
+      case 0x03: r8[MEM_BE2(a)] = d &    3; return;
+      case 0x05: r8[MEM_BE2(a)] = d &    3; return;
+      case 0x07: r8[MEM_BE2(a)] = d &    7; return;
+      case 0x09: r8[MEM_BE2(a)] = d       ; return;
+      case 0x0a: r8[MEM_BE2(a)] = d       ; return;
+      case 0x0b: r8[MEM_BE2(a)] = d & 0xfe; return;
+      case 0x0d: r8[MEM_BE2(a)] = d       ; return;
+      case 0x0e: r8[MEM_BE2(a)] = d       ; return;
+      case 0x0f: r8[MEM_BE2(a)] = d       ; return;
+      case 0x10: r8[MEM_BE2(a)] = d       ; return;
+      case 0x11: r8[MEM_BE2(a)] = d & 0xfc; return;
+      case 0x1a: r8[MEM_BE2(a)] = d &    1; return;
+      case 0x1b: r8[MEM_BE2(a)] = d &    1; return;
+      case 0x20: case 0x21: case 0x22: case 0x23: // COMM
+      case 0x24: case 0x25: case 0x26: case 0x27:
+      case 0x28: case 0x29: case 0x2a: case 0x2b:
+      case 0x2c: case 0x2d: case 0x2e: case 0x2f:
+        r8[MEM_BE2(a)] = d;
+        return;
     }
-
-    // allow only COMM for now
-    if ((a & 0x30) == 0x20) {
-      u8 *r8 = (u8 *)r;
-      r8[a ^ 1] = d;
-    }
-    return;
   }
 
   elprintf(EL_UIO, "m68k unmapped w8  [%06x]   %02x @%06x", a, d & 0xff, SekPc);
@@ -1250,22 +1291,38 @@ void PicoWrite16_32x(u32 a, u32 d)
   {
     u16 *r = Pico32x.regs;
 
-    elprintf(EL_UIO, "m68k 32x w16 [%06x] %04x @%06x", a, d & 0xffff, SekPc);
+    elprintf(EL_32X, "m68k 32x w16 [%06x] %04x @%06x", a, d & 0xffff, SekPc);
     a &= 0x3e;
-    if (a == 0) {
-      if ((d ^ r[0]) & d & P32XS_ADEN) {
-        Pico32xStartup();
-        r[0] &= ~P32XS_nRES; // causes reset if specified by this write
-        r[0] |= P32XS_ADEN;
-        p32x_reg_write16(a, d); // forward for reset processing
-      }
-      return;
+    switch (a) {
+      case 0x00:
+        if ((d ^ r[0]) & d & P32XS_ADEN) {
+          Pico32xStartup();
+          r[0] &= ~(P32XS_FM|P32XS_nRES|P32XS_ADEN);
+          // causes reset if specified by this write
+          r[0] |= d & (P32XS_FM|P32XS_ADEN);
+          p32x_reg_write16(a, d); // forward for reset processing
+        }
+        else {
+          r[0] &= ~(P32XS_FM|P32XS_nRES|P32XS_ADEN);
+          r[0] |= d & (P32XS_FM|P32XS_nRES|P32XS_ADEN);
+        }
+        return;
+      case 0x02: r[a / 2] = d &      3; return;
+      case 0x04: r[a / 2] = d &      3; return;
+      case 0x06: r[a / 2] = d &      7; return;
+      case 0x08: r[a / 2] = d & 0x00ff; return;
+      case 0x0a: r[a / 2] = d & 0xfffe; return;
+      case 0x0c: r[a / 2] = d & 0x00ff; return;
+      case 0x0e: r[a / 2] = d         ; return;
+      case 0x10: r[a / 2] = d & 0xfffc; return;
+      case 0x1a: r[a / 2] = d & 0x0101; return;
+      case 0x20: case 0x22: // COMM
+      case 0x24: case 0x26:
+      case 0x28: case 0x2a:
+      case 0x2c: case 0x2e:
+        r[a / 2] = d;
+        return;
     }
-
-    // allow only COMM for now
-    if ((a & 0x30) == 0x20)
-      r[a / 2] = d;
-    return;
   }
 
   elprintf(EL_UIO, "m68k unmapped w16 [%06x] %04x @%06x", a, d & 0xffff, SekPc);
@@ -1275,7 +1332,7 @@ void PicoWrite16_32x(u32 a, u32 d)
 #define sh2_write8_dramN(p, a, d) \
   if ((d & 0xff) != 0) { \
     u8 *dram = (u8 *)p; \
-    dram[(a & 0x1ffff) ^ 1] = d; \
+    dram[MEM_BE2(a & 0x1ffff)] = d; \
   }
 
 static void m68k_write8_dram0_ow(u32 a, u32 d)
@@ -1315,7 +1372,7 @@ static void m68k_write16_dram1_ow(u32 a, u32 d)
 static void PicoWrite8_hint(u32 a, u32 d)
 {
   if ((a & 0xfffc) == 0x0070) {
-    Pico32xMem->m68k_rom[a ^ 1] = d;
+    Pico32xMem->m68k_rom[MEM_BE2(a)] = d;
     return;
   }
 
@@ -1386,8 +1443,7 @@ static void PicoWrite16_bank(u32 a, u32 d)
 
 static void bank_map_handler(void)
 {
-  cpu68k_map_set(m68k_read8_map,   0x900000, 0x9fffff, PicoRead8_bank, 1);
-  cpu68k_map_set(m68k_read16_map,  0x900000, 0x9fffff, PicoRead16_bank, 1);
+  cpu68k_map_read_funcs(0x900000, 0x9fffff, PicoRead8_bank, PicoRead16_bank, 0);
 }
 
 static void bank_switch_rom_68k(int b)
@@ -1415,18 +1471,15 @@ static void bank_switch_rom_68k(int b)
     rs -= bank;
     if (rs > 0x100000)
       rs = 0x100000;
-    cpu68k_map_set(m68k_read8_map,  0x900000, 0x900000 + rs - 1, Pico.rom + bank, 0);
-    cpu68k_map_set(m68k_read16_map, 0x900000, 0x900000 + rs - 1, Pico.rom + bank, 0);
+    cpu68k_map_read_mem(0x900000, 0x900000 + rs - 1, Pico.rom + bank, 0);
     elprintf(EL_32X, "bank %06x-%06x -> %06x", 0x900000, 0x900000 + rs - 1, bank);
   }
   else {
     bank = bank >> 19;
     bank2 = carthw_ssf2_banks[bank + 0] << 19;
-    cpu68k_map_set(m68k_read8_map,  0x900000, 0x97ffff, Pico.rom + bank2, 0);
-    cpu68k_map_set(m68k_read16_map, 0x900000, 0x97ffff, Pico.rom + bank2, 0);
+    cpu68k_map_read_mem(0x900000, 0x97ffff, Pico.rom + bank2, 0);
     bank2 = carthw_ssf2_banks[bank + 1] << 19;
-    cpu68k_map_set(m68k_read8_map,  0x980000, 0x9fffff, Pico.rom + bank2, 0);
-    cpu68k_map_set(m68k_read16_map, 0x980000, 0x9fffff, Pico.rom + bank2, 0);
+    cpu68k_map_read_mem(0x980000, 0x9fffff, Pico.rom + bank2, 0);
   }
 }
 
@@ -1468,9 +1521,9 @@ static u32 REGPARM(2) sh2_read8_cs0(u32 a, SH2 *sh2)
 
   // TODO: mirroring?
   if (!sh2->is_slave && a < sizeof(Pico32xMem->sh2_rom_m))
-    d = Pico32xMem->sh2_rom_m.b[a ^ 1];
+    d = Pico32xMem->sh2_rom_m.b[MEM_BE2(a)];
   else if (sh2->is_slave  && a < sizeof(Pico32xMem->sh2_rom_s))
-    d = Pico32xMem->sh2_rom_s.b[a ^ 1];
+    d = Pico32xMem->sh2_rom_s.b[MEM_BE2(a)];
   else
     d = sh2_read8_unmapped(a, sh2);
   goto out;
@@ -1493,7 +1546,7 @@ static u32 REGPARM(2) sh2_read8_rom(u32 a, SH2 *sh2)
 {
   u32 bank = carthw_ssf2_banks[(a >> 19) & 7] << 19;
   s8 *p = sh2->p_rom;
-  return p[(bank + (a & 0x7ffff)) ^ 1];
+  return p[MEM_BE2(bank + (a & 0x7ffff))];
 }
 
 // read16
@@ -1569,7 +1622,7 @@ static u32 REGPARM(2) sh2_read32_rom(u32 a, SH2 *sh2)
   u32 bank = carthw_ssf2_banks[(a >> 19) & 7] << 19;
   u32 *p = sh2->p_rom;
   u32 d = p[(bank + (a & 0x7fffc)) / 4];
-  return (d << 16) | (d >> 16);
+  return CPU_BE2(d);
 }
 
 // writes
@@ -1581,19 +1634,19 @@ static void sh2_sdram_poll(u32 a, u32 d, SH2 *sh2)
   DRC_SAVE_SR(sh2);
   cycles = sh2_cycles_done_m68k(sh2);
   sh2_poll_write(a, d, cycles, sh2);
-  p32x_sh2_poll_event(sh2->other_sh2, SH2_STATE_RPOLL, cycles);
+  p32x_sh2_poll_event(a, sh2->other_sh2, SH2_STATE_RPOLL, cycles);
   if (p32x_sh2_ready(sh2->other_sh2, cycles+8))
-    sh2_end_run(sh2, 1);
+    sh2_end_run(sh2, 0);
   DRC_RESTORE_SR(sh2);
 }
 
-void sh2_sdram_checks(u32 a, u32 d, SH2 *sh2, u32 t)
+void NOINLINE sh2_sdram_checks(u32 a, u32 d, SH2 *sh2, u32 t)
 {
   if (t & 0x80)         sh2_sdram_poll(a, d, sh2);
   if (t & 0x7f)         sh2_drc_wcheck_ram(a, 2, sh2);
 }
 
-void sh2_sdram_checks_l(u32 a, u32 d, SH2 *sh2, u32 t)
+void NOINLINE sh2_sdram_checks_l(u32 a, u32 d, SH2 *sh2, u32 t)
 {
   if (t & 0x000080)     sh2_sdram_poll(a, d>>16, sh2);
   if (t & 0x800000)     sh2_sdram_poll(a+2, d, sh2);
@@ -1638,13 +1691,15 @@ static void REGPARM(3) sh2_write8_cs0(u32 a, u32 d, SH2 *sh2)
   if (Pico32x.regs[0] & P32XS_FM) {
     if ((a & 0x3fff0) == 0x4100) {
       sh2->poll_cnt = 0;
-      p32x_vdp_write8(a, d);
+      p32x_vdp_write8(a, d, sh2);
       goto out;
     }
 
     if ((a & 0x3fe00) == 0x4200) {
       sh2->poll_cnt = 0;
-      ((u8 *)Pico32xMem->pal)[(a & 0x1ff) ^ 1] = d;
+      if (((u8 *)Pico32xMem->pal)[MEM_BE2(a & 0x1ff)] != d)
+        Pico32xDrawSync(sh2);
+      ((u8 *)Pico32xMem->pal)[MEM_BE2(a & 0x1ff)] = d;
       Pico32x.dirty_pal = 1;
       goto out;
     }
@@ -1667,7 +1722,7 @@ static void REGPARM(3) sh2_write8_dram(u32 a, u32 d, SH2 *sh2)
 
 static void REGPARM(3) sh2_write8_sdram(u32 a, u32 d, SH2 *sh2)
 {
-  u32 a1 = (a & 0x3ffff) ^ 1;
+  u32 a1 = MEM_BE2(a & 0x3ffff);
   ((u8 *)sh2->p_sdram)[a1] = d;
 #ifdef DRC_SH2
   u8 *p = sh2->p_drcblk_ram;
@@ -1679,7 +1734,7 @@ static void REGPARM(3) sh2_write8_sdram(u32 a, u32 d, SH2 *sh2)
 
 static void REGPARM(3) sh2_write8_da(u32 a, u32 d, SH2 *sh2)
 {
-  u32 a1 = (a & 0xfff) ^ 1;
+  u32 a1 = MEM_BE2(a & 0xfff);
   sh2->data_array[a1] = d;
 #ifdef DRC_SH2
   u8 *p = sh2->p_drcblk_da;
@@ -1718,6 +1773,8 @@ static void REGPARM(3) sh2_write16_cs0(u32 a, u32 d, SH2 *sh2)
 
     if ((a & 0x3fe00) == 0x4200) {
       sh2->poll_cnt = 0;
+      if (Pico32xMem->pal[(a & 0x1ff) / 2] != d)
+        Pico32xDrawSync(sh2);
       Pico32xMem->pal[(a & 0x1ff) / 2] = d;
       Pico32x.dirty_pal = 1;
       goto out;
@@ -1772,7 +1829,7 @@ static void REGPARM(3) sh2_write16_rom(u32 a, u32 d, SH2 *sh2)
   // Presumably the write goes to the CPU cache and is read back from there,
   // but it would be extremely costly to emulate cache behaviour. Just allow
   // writes to that region, hoping that the original ROM values are never used.
-  if ((a1 & 0x3e0000) == 0x3e0000)
+  if ((a1 & 0x3e0000) == 0x3e0000 && (PicoIn.quirks & PQUIRK_WWFRAW_HACK))
     ((u16 *)sh2->p_rom)[a1 / 2] = d;
   else
     sh2_write16_unmapped(a, d, sh2);
@@ -1793,10 +1850,10 @@ static void REGPARM(3) sh2_write32_cs0(u32 a, u32 d, SH2 *sh2)
 #define sh2_write32_dramN(p, a, d) \
   u32 *pd = &((u32 *)p)[(a & 0x1ffff) / 4]; \
   if (!(a & 0x20000)) { \
-    *pd = (d << 16) | (d >> 16); \
+    *pd = CPU_BE2(d); \
   } else { \
     /* overwrite */ \
-    u32 v = *pd, m = 0; d = (d << 16) | (d >> 16) ; \
+    u32 v = *pd, m = 0; d = CPU_BE2(d); \
     if (!(d & 0x000000ff)) m |= 0x000000ff; \
     if (!(d & 0x0000ff00)) m |= 0x0000ff00; \
     if (!(d & 0x00ff0000)) m |= 0x00ff0000; \
@@ -1817,7 +1874,7 @@ static void REGPARM(3) sh2_write32_dram(u32 a, u32 d, SH2 *sh2)
 static void REGPARM(3) sh2_write32_sdram(u32 a, u32 d, SH2 *sh2)
 {
   u32 a1 = a & 0x3fffc;
-  *(u32 *)(sh2->p_sdram + a1) = (d << 16) | (d >> 16);
+  *(u32 *)((char*)sh2->p_sdram + a1) = CPU_BE2(d);
 #ifdef DRC_SH2
   u8 *p = sh2->p_drcblk_ram;
   u32 t = p[a1 >> SH2_DRCBLK_RAM_SHIFT];
@@ -1830,7 +1887,7 @@ static void REGPARM(3) sh2_write32_sdram(u32 a, u32 d, SH2 *sh2)
 static void REGPARM(3) sh2_write32_da(u32 a, u32 d, SH2 *sh2)
 {
   u32 a1 = a & 0xffc;
-  *((u32 *)sh2->data_array + a1/4) = (d << 16) | (d >> 16);
+  *((u32 *)sh2->data_array + a1/4) = CPU_BE2(d);
 #ifdef DRC_SH2
   u8 *p = sh2->p_drcblk_da;
   u32 t = p[a1 >> SH2_DRCBLK_DA_SHIFT];
@@ -1847,7 +1904,7 @@ static void REGPARM(3) sh2_write32_rom(u32 a, u32 d, SH2 *sh2)
   sh2_write16_rom(a + 2, d, sh2);
 }
 
-typedef u32 (sh2_read_handler)(u32 a, SH2 *sh2);
+typedef u32 REGPARM(2) (sh2_read_handler)(u32 a, SH2 *sh2);
 typedef void REGPARM(3) (sh2_write_handler)(u32 a, u32 d, SH2 *sh2);
 
 #define SH2MAP_ADDR2OFFS_R(a) \
@@ -1864,7 +1921,7 @@ u32 REGPARM(2) p32x_sh2_read8(u32 a, SH2 *sh2)
   sh2_map += SH2MAP_ADDR2OFFS_R(a);
   p = sh2_map->addr;
   if (!map_flag_set(p))
-    return *(s8 *)((p << 1) + ((a & sh2_map->mask) ^ 1));
+    return *(s8 *)((p << 1) + MEM_BE2(a & sh2_map->mask));
   else
     return ((sh2_read_handler *)(p << 1))(a, sh2);
 }
@@ -1891,7 +1948,7 @@ u32 REGPARM(2) p32x_sh2_read32(u32 a, SH2 *sh2)
   p = sh2_map->addr;
   if (!map_flag_set(p)) {
     u32 *pd = (u32 *)((p << 1) + (a & sh2_map->mask));
-    return (*pd << 16) | (*pd >> 16);
+    return CPU_BE2(*pd);
   } else
     return ((sh2_read_handler *)(p << 1))(a, sh2);
 }
@@ -1940,17 +1997,27 @@ void *p32x_sh2_get_mem_ptr(u32 a, u32 *mask, SH2 *sh2)
   } else if ((a & 0xc6000000) == 0x02000000) {
     // banked ROM. Return bank address
     u32 bank = carthw_ssf2_banks[(a >> 19) & 7] << 19;
-    ret = sh2->p_rom + bank;
+    ret = (char*)sh2->p_rom + bank;
     *mask = 0x07ffff;
   }
 
   return ret;
 }
 
+int p32x_sh2_mem_is_rom(u32 a, SH2 *sh2)
+{
+  if ((a & 0xc6000000) == 0x02000000) {
+    // ROM, but mind tweak for WWF Raw
+    return !(PicoIn.quirks & PQUIRK_WWFRAW_HACK) || (a & 0x3f0000) < 0x3e0000;
+  }
+
+  return 0;
+}
+
 int p32x_sh2_memcpy(u32 dst, u32 src, int count, int size, SH2 *sh2)
 {
   u32 mask;
-  void *ps, *pd;
+  u8 *ps, *pd;
   int len, i;
 
   // check if src and dst points to memory (rom/sdram/dram/da)
@@ -1967,7 +2034,7 @@ int p32x_sh2_memcpy(u32 dst, u32 src, int count, int size, SH2 *sh2)
 
   // align dst to halfword
   if (dst & 1) {
-    p32x_sh2_write8(dst, *(u8 *)((uptr)ps ^ 1), sh2);
+    p32x_sh2_write8(dst, *(u8 *)MEM_BE2((uptr)ps), sh2);
     ps++, dst++, len --;
   }
 
@@ -2002,7 +2069,7 @@ int p32x_sh2_memcpy(u32 dst, u32 src, int count, int size, SH2 *sh2)
       u32 d;
       for (i = 0; i < (len & ~3); i += 4, dst += 4, sp += 2) {
         d = *(u32 *)sp;
-        p32x_sh2_write32(dst, (d << 16) | (d >> 16), sh2);
+        p32x_sh2_write32(dst, CPU_BE2(d), sh2);
       }
     }
     if (len & 2) {
@@ -2125,7 +2192,6 @@ static const u16 ssh2_code[] = {
   0x2400, 0x0018, // 23c _start_cd
 };
 
-#define HWSWAP(x) (((u16)(x) << 16) | ((x) >> 16))
 static void get_bios(void)
 {
   u16 *ps;
@@ -2155,7 +2221,7 @@ static void get_bios(void)
     ps = (u16 *)Pico32xMem->m68k_rom;
     pl = (u32 *)ps;
     for (i = 1; i < 0xc0/4; i++)
-      pl[i] = HWSWAP(0x880200 + (i - 1) * 6);
+      pl[i] = CPU_BE2(0x880200 + (i - 1) * 6);
     pl[0x70/4] = 0;
 
     // fill with nops
@@ -2182,18 +2248,27 @@ static void get_bios(void)
   }
   else {
     pl = (u32 *)&Pico32xMem->sh2_rom_m;
+    ps = (u16 *)pl;
 
     // fill exception vector table to our trap address
-    for (i = 0; i < 128; i++)
-      pl[i] = HWSWAP(0x200);
+    for (i = 0; i < 80; i++)
+      pl[i] = CPU_BE2(0x200);
+    // CD titles by Digital Pictures jump to 0x140 for resetting ...
+    for (i = 0x140/2; i < 0x1fc/2; i++)
+      ps[i] = 0x0009; // nop         // ... so fill the remainder with nops
+    ps[i++] = 0xa002; // bra 0x204   // ... and jump over the trap
+    ps[i++] = 0x0009; // nop
 
     // start
-    pl[0] = pl[2] = HWSWAP(0x204);
+    pl[0] = pl[2] = CPU_BE2(0x204);
     // reset SP
-    pl[1] = pl[3] = HWSWAP(0x6040000);
+    pl[1] = pl[3] = CPU_BE2(0x6040000);
 
     // startup code
     memcpy(&Pico32xMem->sh2_rom_m.b[0x200], msh2_code, sizeof(msh2_code));
+    if (!Pico.m.ncart_in && (PicoIn.AHW & PAHW_MCD))
+      // hack for MSU games (adjust delay loop for copying the MSU code to sub)
+      Pico32xMem->sh2_rom_m.w[0x224/2] = 0x0090;
   }
 
   // SSH2
@@ -2206,12 +2281,12 @@ static void get_bios(void)
 
     // fill exception vector table to our trap address
     for (i = 0; i < 128; i++)
-      pl[i] = HWSWAP(0x200);
+      pl[i] = CPU_BE2(0x200);
 
     // start
-    pl[0] = pl[2] = HWSWAP(0x204);
+    pl[0] = pl[2] = CPU_BE2(0x204);
     // reset SP
-    pl[1] = pl[3] = HWSWAP(0x603f800);
+    pl[1] = pl[3] = CPU_BE2(0x603f800);
 
     // startup code
     memcpy(&Pico32xMem->sh2_rom_s.b[0x200], ssh2_code, sizeof(ssh2_code));
@@ -2229,10 +2304,8 @@ static sh2_write_handler *ssh2_write8_map[0x80], *ssh2_write16_map[0x80], *ssh2_
 
 void Pico32xSwapDRAM(int b)
 {
-  cpu68k_map_set(m68k_read8_map,   0x840000, 0x85ffff, Pico32xMem->dram[b], 0);
-  cpu68k_map_set(m68k_read16_map,  0x840000, 0x85ffff, Pico32xMem->dram[b], 0);
-  cpu68k_map_set(m68k_read8_map,   0x860000, 0x87ffff, Pico32xMem->dram[b], 0);
-  cpu68k_map_set(m68k_read16_map,  0x860000, 0x87ffff, Pico32xMem->dram[b], 0);
+  cpu68k_map_read_mem(0x840000, 0x85ffff, Pico32xMem->dram[b], 0);
+  cpu68k_map_read_mem(0x860000, 0x87ffff, Pico32xMem->dram[b], 0);
   cpu68k_map_set(m68k_write8_map,  0x840000, 0x87ffff,
                  b ? m68k_write8_dram1_ow : m68k_write8_dram0_ow, 1);
   cpu68k_map_set(m68k_write16_map, 0x840000, 0x87ffff,
@@ -2276,12 +2349,6 @@ void PicoMemSetup32x(void)
   unsigned int rs;
   int i;
 
-  Pico32xMem = plat_mmap(0x06000000, sizeof(*Pico32xMem), 0, 0);
-  if (Pico32xMem == NULL) {
-    elprintf(EL_STATUS, "OOM");
-    return;
-  }
-
   get_bios();
 
   // cartridge area becomes unmapped
@@ -2307,7 +2374,7 @@ void PicoMemSetup32x(void)
     cpu68k_map_set(m68k_write16_map, 0x880000, 0x880000 + rs - 1, PicoWrite16_cart, 1);
 
     // 32X ROM (banked)
-    bank_switch_rom_68k(0);
+    bank_switch_rom_68k(Pico32x.regs[4 / 2]);
     cpu68k_map_set(m68k_write8_map,  0x900000, 0x9fffff, PicoWrite8_bank, 1);
     cpu68k_map_set(m68k_write16_map, 0x900000, 0x9fffff, PicoWrite16_bank, 1);
   }
@@ -2362,9 +2429,10 @@ void PicoMemSetup32x(void)
   msh2_write32_map[0x00/2] = msh2_write32_map[0x20/2] = sh2_write32_cs0;
   // CS1 - ROM
   bank_switch_rom_sh2();
-  msh2_read8_map[0x02/2].mask  = msh2_read8_map[0x22/2].mask  = 0x3fffff; // FIXME
-  msh2_read16_map[0x02/2].mask = msh2_read16_map[0x22/2].mask = 0x3ffffe; // FIXME
-  msh2_read32_map[0x02/2].mask = msh2_read32_map[0x22/2].mask = 0x3ffffc; // FIXME
+  for (rs = 0x8000; rs < Pico.romsize && rs < 0x400000; rs *= 2) ; 
+  msh2_read8_map[0x02/2].mask  = msh2_read8_map[0x22/2].mask  = rs-1;
+  msh2_read16_map[0x02/2].mask = msh2_read16_map[0x22/2].mask = rs-1;
+  msh2_read32_map[0x02/2].mask = msh2_read32_map[0x22/2].mask = rs-1;
   msh2_write16_map[0x02/2] = msh2_write16_map[0x22/2] = sh2_write16_rom;
   msh2_write32_map[0x02/2] = msh2_write32_map[0x22/2] = sh2_write32_rom;
   // CS2 - DRAM 
@@ -2380,6 +2448,7 @@ void PicoMemSetup32x(void)
   msh2_read16_map[0x06/2].addr  = msh2_read16_map[0x26/2].addr  =
   msh2_read32_map[0x06/2].addr  = msh2_read32_map[0x26/2].addr  = MAP_MEMORY(Pico32xMem->sdram);
   msh2_write8_map[0x06/2]       = msh2_write8_map[0x26/2]       = sh2_write8_sdram;
+
   msh2_write16_map[0x06/2]      = msh2_write16_map[0x26/2]      = sh2_write16_sdram;
   msh2_write32_map[0x06/2]      = msh2_write32_map[0x26/2]      = sh2_write32_sdram;
   msh2_read8_map[0x06/2].mask   = msh2_read8_map[0x26/2].mask   = 0x03ffff;
@@ -2415,7 +2484,7 @@ void PicoMemSetup32x(void)
   ssh2_read32_map[0xc0/2].addr = MAP_MEMORY(ssh2.data_array);
 
   // map DRAM area, both 68k and SH2
-  Pico32xSwapDRAM(1);
+  Pico32xSwapDRAM((Pico32x.vdp_regs[0x0a / 2] & P32XV_FS) ^ P32XV_FS);
 
   msh2.read8_map   = msh2_read8_map;  ssh2.read8_map   = ssh2_read8_map;
   msh2.read16_map  = msh2_read16_map; ssh2.read16_map  = ssh2_read16_map;
@@ -2458,12 +2527,12 @@ void Pico32xMemStateLoaded(void)
   memset(Pico32xMem->pwm, 0, sizeof(Pico32xMem->pwm));
   Pico32x.dirty_pal = 1;
 
-  Pico32x.emu_flags &= ~(P32XF_68KCPOLL | P32XF_68KVPOLL);
   memset(&m68k_poll, 0, sizeof(m68k_poll));
   msh2.state = 0;
   msh2.poll_addr = msh2.poll_cycles = msh2.poll_cnt = 0;
   ssh2.state = 0;
   ssh2.poll_addr = ssh2.poll_cycles = ssh2.poll_cnt = 0;
+  memset(sh2_poll_fifo, 0, sizeof(sh2_poll_fifo));
 
   sh2_drc_flush_all();
 }

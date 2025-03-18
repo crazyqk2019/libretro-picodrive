@@ -1,7 +1,7 @@
 /*
  * SH2 recompiler
  * (C) notaz, 2009,2010,2013
- * (C) kub, 2018,2019,2020
+ * (C) irixxxx, 2018-2024
  *
  * This work is licensed under the terms of MAME license.
  * See COPYING file in the top-level directory.
@@ -32,8 +32,8 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#include "../../pico/pico_int.h"
-#include "../../pico/arm_features.h"
+#include <pico/pico_int.h>
+#include <pico/arm_features.h>
 #include "sh2.h"
 #include "compiler.h"
 #include "../drc/cmn.h"
@@ -49,7 +49,7 @@
 #define LOOP_DETECTION          1
 #define LOOP_OPTIMIZER          1
 #define T_OPTIMIZER             1
-#define DIV_OPTIMIZER           0
+#define DIV_OPTIMIZER           1
 
 #define MAX_LITERAL_OFFSET      0x200	// max. MOVA, MOV @(PC) offset
 #define MAX_LOCAL_TARGETS       (BLOCK_INSN_LIMIT / 4)
@@ -68,7 +68,6 @@
 // 200 - compare trace
 // 400 - block entry backtrace on exit
 // 800 - state dump on exit
-// {
 #ifndef DRC_DEBUG
 #define DRC_DEBUG 0//x847
 #endif
@@ -108,10 +107,6 @@ static int insns_compiled, hash_collisions, host_insn_count;
 
 #define GET_Rn() \
   ((op >> 8) & 0x0f)
-
-#define SHR_T	30  // separate T for not-used detection
-#define SHR_MEM	31
-#define SHR_TMP -1
 
 #define T	0x00000001
 #define S	0x00000002
@@ -191,42 +186,60 @@ static char sh2dasm_buff[64];
 
 #define SH2_DUMP(sh2, reason) { \
 	char ms = (sh2)->is_slave ? 's' : 'm'; \
-	printf("%csh2 %s %08x\n", ms, reason, (sh2)->pc); \
-	printf("%csh2 r0-7  %08x %08x %08x %08x %08x %08x %08x %08x\n", ms, \
-		(sh2)->r[0], (sh2)->r[1], (sh2)->r[2], (sh2)->r[3], \
-		(sh2)->r[4], (sh2)->r[5], (sh2)->r[6], (sh2)->r[7]); \
-	printf("%csh2 r8-15 %08x %08x %08x %08x %08x %08x %08x %08x\n", ms, \
-		(sh2)->r[8], (sh2)->r[9], (sh2)->r[10], (sh2)->r[11], \
-		(sh2)->r[12], (sh2)->r[13], (sh2)->r[14], (sh2)->r[15]); \
-	printf("%csh2 pc-ml %08x %08x %08x %08x %08x %08x %08x %08x\n", ms, \
-		(sh2)->pc, (sh2)->ppc, (sh2)->pr, (sh2)->sr&0xfff, \
-		(sh2)->gbr, (sh2)->vbr, (sh2)->mach, (sh2)->macl); \
-	printf("%csh2 tmp-p  %08x %08x %08x %08x %08x %08x %08x %08x\n", ms, \
+	printf("%csh2 %s %08lx\n", ms, reason, (ulong)(sh2)->pc); \
+	printf("%csh2 r0-7  %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n", ms, \
+		(ulong)(sh2)->r[0], (ulong)(sh2)->r[1], (ulong)(sh2)->r[2], (ulong)(sh2)->r[3], \
+		(ulong)(sh2)->r[4], (ulong)(sh2)->r[5], (ulong)(sh2)->r[6], (ulong)(sh2)->r[7]); \
+	printf("%csh2 r8-15 %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n", ms, \
+		(ulong)(sh2)->r[8], (ulong)(sh2)->r[9], (ulong)(sh2)->r[10], (ulong)(sh2)->r[11], \
+		(ulong)(sh2)->r[12], (ulong)(sh2)->r[13], (ulong)(sh2)->r[14], (ulong)(sh2)->r[15]); \
+	printf("%csh2 pc-ml %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n", ms, \
+		(ulong)(sh2)->pc, (ulong)(sh2)->ppc, (ulong)(sh2)->pr, (ulong)(sh2)->sr, \
+		(ulong)(sh2)->gbr, (ulong)(sh2)->vbr, (ulong)(sh2)->mach, (ulong)(sh2)->macl); \
+	printf("%csh2 tmp-p  %08x %08x %08x %08x %08x %08lx %08x %08x\n", ms, \
 		(sh2)->drc_tmp, (sh2)->irq_cycles, \
 		(sh2)->pdb_io_csum[0], (sh2)->pdb_io_csum[1], (sh2)->state, \
-		(sh2)->poll_addr, (sh2)->poll_cycles, (sh2)->poll_cnt); \
+		(ulong)(sh2)->poll_addr, (sh2)->poll_cycles, (sh2)->poll_cnt); \
 }
 
-#if (DRC_DEBUG & (8|256|512|1024)) || defined(PDB)
 #if (DRC_DEBUG & (256|512|1024))
 static SH2 csh2[2][8];
 static FILE *trace[2];
+static int topen[2];
 #endif
+#if (DRC_DEBUG & 8)
+static u32 lastpc, lastcnt;
+static void *lastblock;
+#endif
+#if (DRC_DEBUG & (8|256|512|1024)) || defined(PDB)
 static void REGPARM(3) *sh2_drc_log_entry(void *block, SH2 *sh2, u32 sr)
 {
   if (block != NULL) {
-    dbg(8, "= %csh2 enter %08x %p, c=%d", sh2->is_slave ? 's' : 'm',
-      sh2->pc, block, (signed int)sr >> 12);
 #if defined PDB
+    dbg(8, "= %csh2 enter %08x %p, c=%d", sh2->is_slave?'s':'m',
+      sh2->pc, block, ((signed int)sr >> 12)+1);
     pdb_step(sh2, sh2->pc);
+#elif (DRC_DEBUG & 8)
+    if (lastpc != sh2->pc) {
+      if (lastcnt)
+        dbg(8, "= %csh2 enter %08x %p (%d times), c=%d", sh2->is_slave?'s':'m',
+          lastpc, lastblock, lastcnt, (signed int)sr >> 12);
+      dbg(8, "= %csh2 enter %08x %p, c=%d", sh2->is_slave?'s':'m',
+        sh2->pc, block, (signed int)sr >> 12);
+      lastpc = sh2->pc;
+      lastblock = block;
+      lastcnt = 0;
+    } else
+      lastcnt++;
 #elif (DRC_DEBUG & 256)
   {
+    static SH2 fsh2;
     int idx = sh2->is_slave;
-    if (!trace[0]) {
+    if (!trace[0] && !topen[0]++) {
       trace[0] = fopen("pico.trace0", "wb");
       trace[1] = fopen("pico.trace1", "wb");
     }
-    if (csh2[idx][0].pc != sh2->pc) {
+    if (trace[idx] && csh2[idx][0].pc != sh2->pc) {
       fwrite(sh2, offsetof(SH2, read8_map), 1, trace[idx]);
       fwrite(&sh2->pdb_io_csum, sizeof(sh2->pdb_io_csum), 1, trace[idx]);
       memcpy(&csh2[idx][0], sh2, offsetof(SH2, poll_cnt)+4);
@@ -237,17 +250,17 @@ static void REGPARM(3) *sh2_drc_log_entry(void *block, SH2 *sh2, u32 sr)
   {
     static SH2 fsh2;
     int idx = sh2->is_slave;
-    if (!trace[0]) {
+    if (!trace[0] && !topen[0]++) {
       trace[0] = fopen("pico.trace0", "rb");
       trace[1] = fopen("pico.trace1", "rb");
     }
-    if (csh2[idx][0].pc != sh2->pc) {
+    if (trace[idx] && csh2[idx][0].pc != sh2->pc) {
       if (!fread(&fsh2, offsetof(SH2, read8_map), 1, trace[idx]) ||
           !fread(&fsh2.pdb_io_csum, sizeof(sh2->pdb_io_csum), 1, trace[idx])) {
         printf("trace eof at %08lx\n",ftell(trace[idx]));
         exit(1);
       }
-      fsh2.sr = (fsh2.sr & 0xfff) | (sh2->sr & ~0xfff);
+      fsh2.sr = (fsh2.sr & 0x3ff) | (sh2->sr & ~0x3ff);
       fsh2.is_slave = idx;
       if (memcmp(&fsh2, sh2, offsetof(SH2, read8_map)) ||
           0)//memcmp(&fsh2.pdb_io_csum, &sh2->pdb_io_csum, sizeof(sh2->pdb_io_csum)))
@@ -256,12 +269,14 @@ static void REGPARM(3) *sh2_drc_log_entry(void *block, SH2 *sh2, u32 sr)
         SH2_DUMP(&fsh2, "file");
         SH2_DUMP(sh2, "current");
         SH2_DUMP(&csh2[idx][0], "previous");
+        SH2_DUMP(&csh2[idx][1], "previous");
 	char *ps = (char *)sh2, *pf = (char *)&fsh2;
 	for (idx = 0; idx < offsetof(SH2, read8_map); idx += sizeof(u32))
 		if (*(u32 *)(ps+idx) != *(u32 *)(pf+idx))
-			printf("diff reg %ld\n",idx/sizeof(u32));
+			printf("diff reg %ld\n",(long)idx/sizeof(u32));
         exit(1);
       }
+      memcpy(&csh2[idx][1], &csh2[idx][0], offsetof(SH2, poll_cnt)+4);
       csh2[idx][0] = fsh2;
     }
   }
@@ -384,7 +399,7 @@ static struct block_list *inactive_blocks[TCACHE_BUFFERS];
 // each array has len: sizeof(mem) / INVAL_PAGE_SIZE 
 static struct block_list **inval_lookup[TCACHE_BUFFERS];
 
-#define HASH_TABLE_SIZE(tcid)		((tcid) ? 512 : 64*512)
+#define HASH_TABLE_SIZE(tcid)		((tcid) ? 512 : 32*512)
 static struct block_entry **hash_tables[TCACHE_BUFFERS];
 
 #define HASH_FUNC(hash_tab, addr, mask) \
@@ -462,19 +477,19 @@ static void rcache_free_tmp(int hr);
 // SR must and R0 should by all means be statically mapped.
 // XXX the static definition of SR MUST match that in compiler.h
 
-#ifdef __arm__
+#if defined(__arm__) || defined(_M_ARM)
 #include "../drc/emit_arm.c"
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
 #include "../drc/emit_arm64.c"
 #elif defined(__mips__)
 #include "../drc/emit_mips.c"
 #elif defined(__riscv__) || defined(__riscv)
 #include "../drc/emit_riscv.c"
-#elif defined(__powerpc__)
+#elif defined(__powerpc__) || defined(__PPC__) || defined(__ppc__) || defined(_M_PPC)
 #include "../drc/emit_ppc.c"
-#elif defined(__i386__)
+#elif defined(__i386__) || defined(_M_X86)
 #include "../drc/emit_x86.c"
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(_M_X64)
 #include "../drc/emit_x86.c"
 #else
 #error unsupported arch
@@ -493,7 +508,14 @@ static signed char reg_map_host[HOST_REGS];
 
 static guest_reg_t guest_regs[SH2_REGS];
 
+// generated functions called from C, to be called only through host_call()
 static void REGPARM(1) (*sh2_drc_entry)(SH2 *sh2);
+#ifdef DRC_SR_REG
+void REGPARM(1) (*sh2_drc_save_sr)(SH2 *sh2);
+void REGPARM(1) (*sh2_drc_restore_sr)(SH2 *sh2);
+#endif
+
+// generated DRC helper functions, only called from generated code via emith_call*()
 static void REGPARM(1) (*sh2_drc_dispatcher)(u32 pc);
 #if CALL_STACK
 static u32  REGPARM(2) (*sh2_drc_dispatcher_call)(u32 pc);
@@ -512,11 +534,6 @@ static void REGPARM(2) (*sh2_drc_write8)(u32 a, u32 d);
 static void REGPARM(2) (*sh2_drc_write16)(u32 a, u32 d);
 static void REGPARM(2) (*sh2_drc_write32)(u32 a, u32 d);
 
-#ifdef DRC_SR_REG
-void REGPARM(1) (*sh2_drc_save_sr)(SH2 *sh2);
-void REGPARM(1) (*sh2_drc_restore_sr)(SH2 *sh2);
-#endif
-
 // flags for memory access
 #define MF_SIZEMASK 0x03        // size of access
 #define MF_POSTINCR 0x10        // post increment (for read_rr)
@@ -524,12 +541,6 @@ void REGPARM(1) (*sh2_drc_restore_sr)(SH2 *sh2);
 #define MF_POLLING  0x20	// include polling check in read
 
 // address space stuff
-static int dr_is_rom(u32 a)
-{
-  // tweak for WWF Raw which writes data to some high ROM addresses
-  return (a & 0xc6000000) == 0x02000000 && (a & 0x3f0000) < 0x3e0000;
-}
-
 static int dr_ctx_get_mem_ptr(SH2 *sh2, u32 a, u32 *mask)
 {
   void *memptr;
@@ -720,8 +731,8 @@ static void add_to_hashlist(struct block_entry *be, int tcache_id)
 
 #if (DRC_DEBUG & 2)
   if (be->next != NULL) {
-    printf(" %08x@%p: entry hash collision with %08x@%p\n",
-      be->pc, be->tcache_ptr, be->next->pc, be->next->tcache_ptr);
+    printf(" %08lx@%p: entry hash collision with %08lx@%p\n",
+      (ulong)be->pc, be->tcache_ptr, (ulong)be->next->pc, be->next->tcache_ptr);
     hash_collisions++;
   }
 #endif
@@ -749,6 +760,7 @@ static void rm_from_hashlist(struct block_entry *be, int tcache_id)
 }
 
 
+#if LINK_BRANCHES
 static void add_to_hashlist_unresolved(struct block_link *bl, int tcache_id)
 {
   u32 tcmask = HASH_TABLE_SIZE(tcache_id) - 1;
@@ -791,7 +803,6 @@ static void rm_from_hashlist_unresolved(struct block_link *bl, int tcache_id)
     bl->next->prev = bl->prev;
 }
 
-#if LINK_BRANCHES
 static void dr_block_link(struct block_entry *be, struct block_link *bl, int emit_jump)
 {
   dbg(2, "- %slink from %p to pc %08x entry %p", emit_jump ? "":"early ",
@@ -815,16 +826,14 @@ static void dr_block_link(struct block_entry *be, struct block_link *bl, int emi
         // via blx: @jump near jumpcc to blx; @blx far jump
         emith_jump_patch(jump, bl->blx, &jump);
         emith_jump_at(bl->blx, be->tcache_ptr);
-        if ((((uintptr_t)bl->blx & 0x1f) + emith_jump_at_size()-1) > 0x1f)
-          host_instructions_updated(bl->blx, bl->blx + emith_jump_at_size()-1);
+        host_instructions_updated(bl->blx, (char *)bl->blx + emith_jump_at_size(),
+            ((uintptr_t)bl->blx & 0x1f) + emith_jump_at_size()-1 > 0x1f);
       }
     } else {
       printf("unknown BL type %d\n", bl->type);
       exit(1);
     }
-    // only needs sync if patch is possibly crossing cacheline (assume 32 byte)
-    if ((((uintptr_t)jump & 0x1f) + jsz-1) > 0x1f)
-      host_instructions_updated(jump, jump + jsz-1);
+    host_instructions_updated(jump, jump + jsz, ((uintptr_t)jump & 0x1f) + jsz-1 > 0x1f);
   }
 
   // move bl to block_entry
@@ -855,13 +864,13 @@ static void dr_block_unlink(struct block_link *bl, int emit_jump)
         // via blx: @jump near jumpcc to blx; @blx load target_pc, far jump
         emith_jump_patch(bl->jump, bl->blx, &jump);
         memcpy(bl->blx, bl->jdisp, emith_jump_at_size());
-        host_instructions_updated(bl->blx, bl->blx + emith_jump_at_size()-1);
+        host_instructions_updated(bl->blx, (char *)bl->blx + emith_jump_at_size(), 1);
       } else {
         printf("unknown BL type %d\n", bl->type);
         exit(1);
       }
       // update cpu caches since the previous jump target doesn't exist anymore
-      host_instructions_updated(jump, jump + jsz-1);
+      host_instructions_updated(jump, jump + jsz, 1);
     }
 
     if (bl->prev)
@@ -1021,23 +1030,23 @@ static void dr_rm_block_entry(struct block_desc *bd, int tcache_id, u32 nolit, i
     return;
   }
 
-#if LINK_BRANCHES
   // remove from hash table, make incoming links unresolved
   if (bd->active) {
     for (i = 0; i < bd->entry_count; i++) {
       rm_from_hashlist(&bd->entryp[i], tcache_id);
 
+#if LINK_BRANCHES
       while ((bl = bd->entryp[i].links) != NULL) {
         dr_block_unlink(bl, 1);
         add_to_hashlist_unresolved(bl, tcache_id);
       }
+#endif
     }
 
     dr_mark_memory(-1, bd, tcache_id, nolit);
     add_to_block_list(&inactive_blocks[tcache_id], bd);
   }
   bd->active = 0;
-#endif
 
   if (free) {
 #if LINK_BRANCHES
@@ -1057,7 +1066,6 @@ static void dr_rm_block_entry(struct block_desc *bd, int tcache_id, u32 nolit, i
     rm_from_block_lists(bd);
     bd->addr = bd->size = bd->addr_lit = bd->size_lit = 0;
     bd->entry_count = 0;
-    bd->entryp = NULL;
   }
   emith_update_cache();
 }
@@ -1343,6 +1351,7 @@ static void rcache_add_vreg_alias(int x, sh2_reg_e r);
 static void rcache_remove_vreg_alias(int x, sh2_reg_e r);
 static void rcache_evict_vreg(int x);
 static void rcache_remap_vreg(int x);
+static int rcache_get_reg(sh2_reg_e r, rc_gr_mode mode, int *hr);
 
 static void rcache_set_x16(int hr, int s16_, int u16_)
 {
@@ -1384,7 +1393,7 @@ static int rcache_is_u16(int hr)
   for (i = 0; i < ARRAY_SIZE(cache_regs); i++) { \
     cp = &cache_regs[i]; \
     if (cp->type != HR_FREE || cp->gregs || cp->locked || cp->flags) \
-      printf("  %d: hr=%d t=%d f=%x c=%d m=%x\n", i, cp->hreg, cp->type, cp->flags, cp->locked, cp->gregs); \
+      printf("  %d: hr=%d t=%d f=%x c=%d m=%lx\n", i, cp->hreg, cp->type, cp->flags, cp->locked, (ulong)cp->gregs); \
   } \
   printf(" guest_regs:\n"); \
   for (i = 0; i < ARRAY_SIZE(guest_regs); i++) { \
@@ -1395,7 +1404,7 @@ static int rcache_is_u16(int hr)
   printf(" gconsts:\n"); \
   for (i = 0; i < ARRAY_SIZE(gconsts); i++) { \
     if (gconsts[i].gregs) \
-      printf("  %d: m=%x v=%x\n", i, gconsts[i].gregs, gconsts[i].val); \
+      printf("  %d: m=%lx v=%lx\n", i, (ulong)gconsts[i].gregs, (ulong)gconsts[i].val); \
   } \
 }
 
@@ -1448,7 +1457,6 @@ static int rcache_is_u16(int hr)
   } */ \
 }
 
-#if PROPAGATE_CONSTANTS
 static inline int gconst_alloc(sh2_reg_e r)
 {
   int i, n = -1;
@@ -1485,7 +1493,6 @@ static void gconst_new(sh2_reg_e r, u32 val)
   if (guest_regs[r].vreg >= 0)
     rcache_remove_vreg_alias(guest_regs[r].vreg, r);
 }
-#endif
 
 static int gconst_get(sh2_reg_e r, u32 *val)
 {
@@ -1730,11 +1737,7 @@ static void rcache_remove_vreg_alias(int x, sh2_reg_e r)
 
 static void rcache_evict_vreg(int x)
 {
-#if REMAP_REGISTER
   rcache_remap_vreg(x);
-#else
-  rcache_clean_vreg(x);
-#endif
   rcache_unmap_vreg(x);
 }
 
@@ -1827,10 +1830,10 @@ static int rcache_allocate_temp(void)
   return x;
 }
 
-#if REMAP_REGISTER
 // maps a host register to a REG
 static int rcache_map_reg(sh2_reg_e r, int hr)
 {
+#if REMAP_REGISTER
   int i;
 
   gconst_kill(r);
@@ -1861,11 +1864,15 @@ static int rcache_map_reg(sh2_reg_e r, int hr)
   RCACHE_CHECK("after map");
 #endif
   return cache_regs[i].hreg;
+#else
+  return rcache_get_reg(r, RC_GR_WRITE, NULL);
+#endif
 }
 
 // remap vreg from a TEMP to a REG if it will be used (upcoming TEMP invalidation)
 static void rcache_remap_vreg(int x)
 {
+#if REMAP_REGISTER
   u32 rsl_d = rcache_regs_soon | rcache_regs_late;
   int d;
 
@@ -1904,12 +1911,14 @@ static void rcache_remap_vreg(int x)
 #if DRC_DEBUG & 64
   RCACHE_CHECK("after remap");
 #endif
-}
+#else
+  rcache_clean_vreg(x);
 #endif
+}
 
-#if ALIAS_REGISTERS
 static void rcache_alias_vreg(sh2_reg_e rd, sh2_reg_e rs)
 {
+#if ALIAS_REGISTERS
   int x;
 
   // if s isn't constant, it must be in cache for aliasing
@@ -1937,8 +1946,14 @@ static void rcache_alias_vreg(sh2_reg_e rd, sh2_reg_e rs)
 #if DRC_DEBUG & 64
   RCACHE_CHECK("after alias");
 #endif
-}
+#else
+  int hr_s = rcache_get_reg(rs, RC_GR_READ, NULL);
+  int hr_d = rcache_get_reg(rd, RC_GR_WRITE, NULL);
+
+  emith_move_r_r(hr_d, hr_s);
+  gconst_copy(rd, rs);
 #endif
+}
 
 // note: must not be called when doing conditional code
 static int rcache_get_reg_(sh2_reg_e r, rc_gr_mode mode, int do_locking, int *hr)
@@ -2386,11 +2401,7 @@ static void rcache_clean_tmp(void)
   for (i = 0; i < ARRAY_SIZE(cache_regs); i++)
     if (cache_regs[i].type == HR_CACHED && (cache_regs[i].htype & HRT_TEMP)) {
       rcache_unlock(i);
-#if REMAP_REGISTER
       rcache_remap_vreg(i);
-#else
-      rcache_clean_vreg(i);
-#endif
     }
   rcache_regs_clean = 0;
 }
@@ -2570,8 +2581,48 @@ static void rcache_init(void)
 
 // ---------------------------------------------------------------
 
+// swap 32 bit value read from mem in generated code (same as CPU_BE2)
+static void emit_le_swap(int cond, int r)
+{
+#if CPU_IS_LE
+  if (cond == -1)
+    emith_ror(r, r, 16);
+  else
+    emith_ror_c(cond, r, r, 16);
+#endif
+}
+
+// fix memory byte ptr in generated code (same as MEM_BE2)
+static void emit_le_ptr8(int cond, int r)
+{
+#if CPU_IS_LE
+  if (cond == -1)
+    emith_eor_r_imm_ptr(r, 1);
+  else
+    emith_eor_r_imm_ptr_c(cond, r, 1);
+#endif
+}
+
+// split address by mask, in base part (upper) and offset (lower, signed!)
+static uptr split_address(uptr la, uptr mask, s32 *offs)
+{
+  uptr sign = (mask>>1) + 1; // sign bit in offset
+  *offs = (la & mask) | (la & sign ? ~mask : 0); // offset part, sign extended
+  la = (la & ~mask) + ((la & sign) << 1); // base part, corrected for offs sign
+#ifdef __arm__
+  // arm32 offset has an add/sub flag and an unsigned 8 bit value, which only
+  // allows values of [-255...255]. the value -256 thus can't be used.
+  if (*offs < 0) {  // TODO not working at all with negative offsets on ARM?
+  //if (*offs == -sign) {
+    la -= sign;
+    *offs += sign;
+  }
+#endif
+  return la;
+}
+
 // NB may return either REG or TEMP
-static int emit_get_rbase_and_offs(SH2 *sh2, sh2_reg_e r, int rmode, u32 *offs)
+static int emit_get_rbase_and_offs(SH2 *sh2, sh2_reg_e r, int rmode, s32 *offs)
 {
   uptr omask = emith_rw_offs_max(); // offset mask
   u32 mask = 0;
@@ -2583,7 +2634,7 @@ static int emit_get_rbase_and_offs(SH2 *sh2, sh2_reg_e r, int rmode, u32 *offs)
   // is r constant and points to a memory region?
   if (! gconst_get(r, &a))
     return -1;
-  poffs = dr_ctx_get_mem_ptr(sh2, a, &mask);
+  poffs = dr_ctx_get_mem_ptr(sh2, a + *offs, &mask);
   if (poffs == -1)
     return -1;
 
@@ -2594,14 +2645,14 @@ static int emit_get_rbase_and_offs(SH2 *sh2, sh2_reg_e r, int rmode, u32 *offs)
     a = (a + *offs) & mask;
     if (poffs == offsetof(SH2, p_da)) {
       // access sh2->data_array directly
-      a += offsetof(SH2, data_array);
-      emith_add_r_r_ptr_imm(hr, CONTEXT_REG, a & ~omask);
+      a = split_address(a + offsetof(SH2, data_array), omask, offs);
+      emith_add_r_r_ptr_imm(hr, CONTEXT_REG, a);
     } else {
+      a = split_address(a, omask, offs);
       emith_ctx_read_ptr(hr, poffs);
-      if (a & ~omask)
-        emith_add_r_r_ptr_imm(hr, hr, a & ~omask);
+      if (a)
+        emith_add_r_r_ptr_imm(hr, hr, a);
     }
-    *offs = a & omask;
     return hr;
   }
 
@@ -2610,29 +2661,35 @@ static int emit_get_rbase_and_offs(SH2 *sh2, sh2_reg_e r, int rmode, u32 *offs)
 
   // if r is in rcache or needed soon anyway, and offs is relative to region,
   // and address translation fits in add_ptr_imm (s32), then use rcached const 
-  if (la == (s32)la && !(*offs & ~mask) && rcache_is_cached(r)) {
-    u32 odd = a & 1; // need to fix odd address for correct byte addressing
-    la -= (s32)((a & ~mask) - *offs - odd); // diff between reg and memory
+  if (la == (s32)la && !(((a & mask) + *offs) & ~mask) && rcache_is_cached(r)) {
+#if CPU_IS_LE // need to fix odd address for correct byte addressing
+    if (a & 1) *offs += (*offs&1) ? 2 : -2;
+#endif
+    la -= (s32)((a & ~mask) - *offs); // diff between reg and memory
     hr = hr2 = rcache_get_reg(r, rmode, NULL);
     if ((s32)a < 0) emith_uext_ptr(hr2);
-    if ((la & ~omask) - odd) {
+    la = split_address(la, omask, offs);
+    if (la) {
       hr = rcache_get_tmp();
-      emith_add_r_r_ptr_imm(hr, hr2, (la & ~omask) - odd);
+      emith_add_r_r_ptr_imm(hr, hr2, la);
       rcache_free(hr2);
     }
-    *offs = (la & omask);
   } else {
     // known fixed host address
-    la += (a + *offs) & mask;
+    la = split_address(la + ((a + *offs) & mask), omask, offs);
+    if (la == 0) {
+      // offset only. optimize for hosts having short indexed addressing
+      la = *offs & ~0x7f;  // keep the lower bits for endianess handling
+      *offs &= 0x7f;
+    }
     hr = rcache_get_tmp();
-    emith_move_r_ptr_imm(hr, la & ~omask);
-    *offs = la & omask;
+    emith_move_r_ptr_imm(hr, la);
   }
   return hr;
 }
 
 // read const data from const ROM address
-static int emit_get_rom_data(SH2 *sh2, sh2_reg_e r, u32 offs, int size, u32 *val)
+static int emit_get_rom_data(SH2 *sh2, sh2_reg_e r, s32 offs, int size, u32 *val)
 {
   u32 a, mask;
 
@@ -2640,7 +2697,7 @@ static int emit_get_rom_data(SH2 *sh2, sh2_reg_e r, u32 offs, int size, u32 *val
   if (gconst_get(r, &a)) {
     a += offs;
     // check if rom is memory mapped (not bank switched), and address is in rom
-    if (dr_is_rom(a) && p32x_sh2_get_mem_ptr(a, &mask, sh2) == sh2->p_rom) {
+    if (p32x_sh2_mem_is_rom(a, sh2) && p32x_sh2_get_mem_ptr(a, &mask, sh2) == sh2->p_rom) {
       switch (size & MF_SIZEMASK) {
       case 0:   *val = (s8)p32x_sh2_read8(a, sh2s);   break;  // 8
       case 1:   *val = (s16)p32x_sh2_read16(a, sh2s); break;  // 16
@@ -2664,16 +2721,9 @@ static void emit_move_r_imm32(sh2_reg_e dst, u32 imm)
 
 static void emit_move_r_r(sh2_reg_e dst, sh2_reg_e src)
 {
-  if (gconst_check(src) || rcache_is_cached(src)) {
-#if ALIAS_REGISTERS
+  if (gconst_check(src) || rcache_is_cached(src))
     rcache_alias_vreg(dst, src);
-#else
-    int hr_s = rcache_get_reg(src, RC_GR_READ, NULL);
-    int hr_d = rcache_get_reg(dst, RC_GR_WRITE, NULL);
-    emith_move_r_r(hr_d, hr_s);
-    gconst_copy(dst, src);
-#endif
-  } else {
+  else {
     int hr_d = rcache_get_reg(dst, RC_GR_WRITE, NULL);
     emith_ctx_read(hr_d, src * 4);
   }
@@ -2773,7 +2823,7 @@ static void emit_memhandler_write(int size)
 }
 
 // rd = @(Rs,#offs); rd < 0 -> return a temp
-static int emit_memhandler_read_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, u32 offs, int size)
+static int emit_memhandler_read_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, s32 offs, int size)
 {
   int hr, hr2;
   u32 val;
@@ -2801,9 +2851,9 @@ static int emit_memhandler_read_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, u32 off
     else
       hr2 = rcache_get_reg(rd, RC_GR_WRITE, NULL);
     switch (size & MF_SIZEMASK) {
-    case 0: emith_read8s_r_r_offs(hr2, hr, offs ^ 1);  break; // 8
-    case 1: emith_read16s_r_r_offs(hr2, hr, offs);     break; // 16
-    case 2: emith_read_r_r_offs(hr2, hr, offs); emith_ror(hr2, hr2, 16); break;
+    case 0: emith_read8s_r_r_offs(hr2, hr, MEM_BE2(offs));  break; // 8
+    case 1: emith_read16s_r_r_offs(hr2, hr, offs);          break; // 16
+    case 2: emith_read_r_r_offs(hr2, hr, offs); emit_le_swap(-1, hr2); break;
     }
     rcache_free(hr);
     if (size & MF_POSTINCR)
@@ -2834,11 +2884,7 @@ static int emit_memhandler_read_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, u32 off
   if (rd == SHR_TMP)
     hr2 = hr;
   else
-#if REMAP_REGISTER
     hr2 = rcache_map_reg(rd, hr);
-#else
-    hr2 = rcache_get_reg(rd, RC_GR_WRITE, NULL);
-#endif
 
   if (hr != hr2) {
     emith_move_r_r(hr2, hr);
@@ -2848,7 +2894,7 @@ static int emit_memhandler_read_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, u32 off
 }
 
 // @(Rs,#offs) = rd; rd < 0 -> write arg1
-static void emit_memhandler_write_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, u32 offs, int size)
+static void emit_memhandler_write_rr(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rs, s32 offs, int size)
 {
   int hr, hr2;
   u32 val;
@@ -2908,11 +2954,7 @@ static int emit_indirect_indexed_read(SH2 *sh2, sh2_reg_e rd, sh2_reg_e rx, sh2_
   if (rd == SHR_TMP)
     hr2 = hr;
   else
-#if REMAP_REGISTER
     hr2 = rcache_map_reg(rd, hr);
-#else
-    hr2 = rcache_get_reg(rd, RC_GR_WRITE, NULL);
-#endif
 
   if (hr != hr2) {
     emith_move_r_r(hr2, hr);
@@ -2993,49 +3035,59 @@ static void emit_do_static_regs(int is_write, int tmpr)
 // divide operation replacement functions, called by compiled code. Only the
 // 32:16 cases and the 64:32 cases described in the SH2 prog man are replaced.
 
-static uint32_t REGPARM(2) sh2_drc_divu32(uint32_t dv, uint32_t ds)
+// This is surprisingly difficult since the SH2 division operation is generating
+// the result in the dividend during the operation, leaving some remainder-like
+// stuff in the bits unused for the result, and leaving the T and Q status bits
+// in a state depending on the operands and the result. Q always reflects the
+// last result bit generated (i.e. bit 0 of the result). For T:
+//	32:16	T = top bit of the 16 bit remainder-like
+//	64:32	T = resulting T of the DIV0U/S operation
+// The remainder-like depends on outcome of the last generated result bit.
+
+static uint32_t REGPARM(3) sh2_drc_divu32(uint32_t dv, uint32_t *dt, uint32_t ds)
 {
-  if (ds && ds >= dv) {
-    // good case: no divide by 0, and no result overflow
+  if (likely(ds > dv && (uint16_t)ds == 0)) {
+    // good case: no overflow, divisor not 0, lower 16 bits 0
     uint32_t quot = dv / (ds>>16), rem = dv - (quot * (ds>>16));
     if (~quot&1) rem -= ds>>16;
+    *dt = (rem>>15) & 1;
     return (uint16_t)quot | ((2*rem + (quot>>31)) << 16);
   } else {
     // bad case: use the sh2 algo to get the right result
     int q = 0, t = 0, s = 16;
     while (s--) {
-      uint32_t _ = dv>>31;
+      uint32_t v = dv>>31;
       dv = (dv<<1) | t;
-      t = _;
-      _ = dv;
-      if (q)  dv += ds, q =   dv < _;
-      else    dv -= ds, q = !(dv < _);
+      t = v;
+      v = dv;
+      if (q)  dv += ds, q = dv < v;
+      else    dv -= ds, q = dv > v;
       q ^= t, t = !q;
     }
+    *dt = dv>>31;
     return (dv<<1) | t;
   }
 }
 
 static uint32_t REGPARM(3) sh2_drc_divu64(uint32_t dh, uint32_t *dl, uint32_t ds)
 {
-  if (ds > 1 && ds >= dh) {
-    // good case: no divide by 0, and no result overflow
-    uint64_t dv = *dl | ((uint64_t)dh << 32);
-    uint32_t quot = dv / ds, rem = dv - (quot * ds);
+  uint64_t dv = *dl | ((uint64_t)dh << 32);
+  if (likely(ds > dh)) {
+    // good case: no overflow, divisor not 0
+    uint32_t quot = dv / ds, rem = dv - ((uint64_t)quot * ds);
     if (~quot&1) rem -= ds;
     *dl = quot;
     return rem;
   } else {
     // bad case: use the sh2 algo to get the right result
-    uint64_t dv = *dl | ((uint64_t)dh << 32);
     int q = 0, t = 0, s = 32;
     while (s--) {
-      uint64_t _ = dv>>63;
+      uint64_t v = dv>>63;
       dv = (dv<<1) | t;
-      t = _;
-      _ = dv;
-      if (q)  dv += ((uint64_t)ds << 32), q =   dv < _;
-      else    dv -= ((uint64_t)ds << 32), q = !(dv < _);
+      t = v;
+      v = dv;
+      if (q)  dv += ((uint64_t)ds << 32), q = dv < v;
+      else    dv -= ((uint64_t)ds << 32), q = dv > v;
       q ^= t, t = !q;
     }
     *dl = (dv<<1) | t;
@@ -3043,29 +3095,31 @@ static uint32_t REGPARM(3) sh2_drc_divu64(uint32_t dh, uint32_t *dl, uint32_t ds
   }
 }
 
-static uint32_t REGPARM(2) sh2_drc_divs32(int32_t dv, int32_t ds)
+static uint32_t REGPARM(3) sh2_drc_divs32(int32_t dv, uint32_t *dt, int32_t ds)
 {
   uint32_t adv = abs(dv), ads = abs(ds)>>16;
-  if (ads > 1 && ads > adv>>16 && (int32_t)ads > 0 && !(uint16_t)ds) {
-    // good case: no divide by 0, and no result overflow
+  if (likely(ads > adv>>16 && ds != 0x80000000 && (int16_t)ds == 0)) {
+    // good case: no overflow, divisor not 0 and not MIN_INT, lower 16 bits 0
     uint32_t quot = adv / ads, rem = adv - (quot * ads);
     int m1 = (rem ? dv^ds : ds) < 0;
     if (rem && dv < 0)  rem = (quot&1 ? -rem : +ads-rem);
     else                rem = (quot&1 ? +rem : -ads+rem);
     quot = ((dv^ds)<0 ? -quot : +quot) - m1;
+    *dt = (rem>>15) & 1;
     return (uint16_t)quot | ((2*rem + (quot>>31)) << 16);
   } else {
     // bad case: use the sh2 algo to get the right result
     int m = (uint32_t)ds>>31, q = (uint32_t)dv>>31, t = m^q, s = 16;
     while (s--) {
-      uint32_t _ = (uint32_t)dv>>31;
+      uint32_t v = (uint32_t)dv>>31;
       dv = (dv<<1) | t;
-      t = _;
-      _ = dv;
-      if (m^q)  dv += ds, q =   (uint32_t)dv < _;
-      else      dv -= ds, q = !((uint32_t)dv < _);
+      t = v;
+      v = dv;
+      if (m^q)  dv += ds, q = (uint32_t)dv < v;
+      else      dv -= ds, q = (uint32_t)dv > v;
       q ^= m^t, t = !(m^q);
     }
+    *dt = (uint32_t)dv>>31;
     return (dv<<1) | t;
   }
 }
@@ -3073,10 +3127,11 @@ static uint32_t REGPARM(2) sh2_drc_divs32(int32_t dv, int32_t ds)
 static uint32_t REGPARM(3) sh2_drc_divs64(int32_t dh, uint32_t *dl, int32_t ds)
 {
   int64_t _dv = *dl | ((int64_t)dh << 32);
-  uint64_t adv = (_dv < 0 ? -_dv : _dv); // llabs isn't in older toolchains
   uint32_t ads = abs(ds);
-  if (ads > 1 && ads > adv>>32 && (int64_t)adv > 0) {
-    // good case: no divide by 0, and no result overflow
+  if (likely(_dv >= 0 && ads > _dv>>32 && ds != 0x80000000) ||
+      likely(_dv < 0 && ads > -_dv>>32 && ds != 0x80000000)) {
+    uint64_t adv = (_dv < 0 ? -_dv : _dv); // no llabs in older toolchains
+    // good case: no overflow, divisor not 0 and not MIN_INT
     uint32_t quot = adv / ads, rem = adv - ((uint64_t)quot * ads);
     int m1 = (rem ? dh^ds : ds) < 0;
     if (rem && dh < 0) rem = (quot&1 ? -rem : +ads-rem);
@@ -3086,15 +3141,15 @@ static uint32_t REGPARM(3) sh2_drc_divs64(int32_t dh, uint32_t *dl, int32_t ds)
     return rem;
   } else {
     // bad case: use the sh2 algo to get the right result
-    uint64_t dv = *dl | ((uint64_t)dh << 32);
+    uint64_t dv = (uint64_t)_dv;
     int m = (uint32_t)ds>>31, q = (uint64_t)dv>>63, t = m^q, s = 32;
     while (s--) {
-      int64_t _ = (uint64_t)dv>>63;
+      uint64_t v = (uint64_t)dv>>63;
       dv = (dv<<1) | t;
-      t = _;
-      _ = dv;
-      if (m^q)  dv += ((uint64_t)ds << 32), q =   dv < _;
-      else      dv -= ((uint64_t)ds << 32), q = !(dv < _);
+      t = v;
+      v = dv;
+      if (m^q)  dv += ((uint64_t)ds << 32), q = dv < v;
+      else      dv -= ((uint64_t)ds << 32), q = dv > v;
       q ^= m^t, t = !(m^q);
     }
     *dl = (dv<<1) | t;
@@ -3192,12 +3247,14 @@ static void emit_branch_linkage_code(SH2 *sh2, struct block_desc *block, int tca
 }
 
 #define FLUSH_CYCLES(sr) \
-  if (cycles > 0) { \
+  if (cycles > 0) \
     emith_sub_r_imm(sr, cycles << 12); \
-    cycles = 0; \
-  }
+  else if (cycles < 0) /* may happen after a branch not taken */ \
+    emith_add_r_imm(sr, -cycles << 12); \
+  cycles = 0; \
 
 static void *dr_get_pc_base(u32 pc, SH2 *sh2);
+static void sh2_smc_rm_blocks(u32 a, int len, int tcache_id, int free);
 
 static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
 {
@@ -3252,7 +3309,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
   // get base/validate PC
   dr_pc_base = dr_get_pc_base(base_pc, sh2);
   if (dr_pc_base == (void *)-1) {
-    printf("invalid PC, aborting: %08x\n", base_pc);
+    printf("invalid PC, aborting: %08lx\n", (long)base_pc);
     // FIXME: be less destructive
     exit(1);
   }
@@ -3266,6 +3323,13 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
   // if there is already a translated but inactive block, reuse it
   block = dr_find_inactive_block(tcache_id, crc, base_pc, end_pc - base_pc,
     base_literals, end_literals - base_literals);
+
+#if (DRC_DEBUG & (256|512))
+  // remove any (partial) old blocks which might get in the way, to make sure
+  // the same branch targets are used in the recording/playback code. Not needed
+  // normally since the SH2 code wasn't overwritten and should be the same.
+  sh2_smc_rm_blocks(base_pc, end_pc - base_pc, tcache_id, 0);
+#endif
 
   if (block) {
     dbg(2, "== %csh2 reuse block %08x-%08x,%08x-%08x -> %p", sh2->is_slave ? 's' : 'm',
@@ -3487,7 +3551,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
         // if exiting a pinned loop pinned regs must be written back to ctx
         // since they are reloaded in the loop entry code
         emith_cmp_r_imm(sr, 0);
-        EMITH_JMP_START(DCOND_GT);
+        EMITH_JMP_START(DCOND_GE);
         rcache_save_pinned();
 
         if (blx_target_count < ARRAY_SIZE(blx_targets)) {
@@ -3502,7 +3566,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
           emith_jump(sh2_drc_exit);
           rcache_free_tmp(tmp);
         }
-        EMITH_JMP_END(DCOND_GT);
+        EMITH_JMP_END(DCOND_GE);
       } else
 #endif
       {
@@ -3511,15 +3575,15 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
           emith_cmp_r_imm(sr, 0);
           blx_targets[blx_target_count++] =
               (struct linkage) { .pc = pc, .ptr = tcache_ptr, .mask = 0x1 };
-          emith_jump_cond_patchable(DCOND_LE, tcache_ptr);
+          emith_jump_cond_patchable(DCOND_LT, tcache_ptr);
         } else {
           // blx table full, must inline exit code
           tmp = rcache_get_tmp_arg(0);
           emith_cmp_r_imm(sr, 0);
-          EMITH_SJMP_START(DCOND_GT);
-          emith_move_r_imm_c(DCOND_LE, tmp, pc);
-          emith_jump_cond(DCOND_LE, sh2_drc_exit);
-          EMITH_SJMP_END(DCOND_GT);
+          EMITH_SJMP_START(DCOND_GE);
+          emith_move_r_imm_c(DCOND_LT, tmp, pc);
+          emith_jump_cond(DCOND_LT, sh2_drc_exit);
+          EMITH_SJMP_END(DCOND_GE);
           rcache_free_tmp(tmp);
         }
       }
@@ -3552,7 +3616,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       emith_move_r_imm(tmp4, pc);
       emith_ctx_write(tmp4, SHR_PC * 4);
       rcache_invalidate_tmp();
-      emith_call(sh2_drc_log_entry);
+      emith_abicall(sh2_drc_log_entry);
       emith_restore_caller_regs(tmp);
 #endif
 
@@ -3572,7 +3636,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       emith_save_caller_regs(tmp);
       emit_do_static_regs(1, 0);
       emith_pass_arg_r(0, CONTEXT_REG);
-      emith_call(do_sh2_cmp);
+      emith_abicall(do_sh2_cmp);
       emith_restore_caller_regs(tmp);
     }
 #endif
@@ -3604,7 +3668,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       else                                              tmp3 = '*';
     } else if (drcf.loop_type)                          tmp3 = '.';
     else                                                tmp3 = ' ';
-    printf("%c%08x %04x %s\n", tmp3, pc, op, sh2dasm_buff);
+    printf("%c%08lx %04x %s\n", tmp3, (ulong)pc, op, sh2dasm_buff);
 #endif
 
     pc += 2;
@@ -3774,14 +3838,12 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
     case OP_LOAD_POOL:
 #if PROPAGATE_CONSTANTS
       if ((opd->imm && opd->imm >= base_pc && opd->imm < end_literals) ||
-          dr_is_rom(opd->imm))
+          p32x_sh2_mem_is_rom(opd->imm, sh2))
       {
         if (opd->size == 2)
           u = FETCH32(opd->imm);
         else
           u = (s16)FETCH_OP(opd->imm);
-        // tweak for Blackthorne: avoid stack overwriting
-        if (GET_Rn() == SHR_SP && u == 0x0603f800) u = 0x0603f880;
         gconst_new(GET_Rn(), u);
       }
       else
@@ -3801,11 +3863,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
             emith_add_r_r_imm(tmp, tmp2, 2 + (op & 0xff) * 2);
         }
         tmp2 = emit_memhandler_read(opd->size);
-#if REMAP_REGISTER
         tmp3 = rcache_map_reg(GET_Rn(), tmp2);
-#else
-        tmp3 = rcache_get_reg(GET_Rn(), RC_GR_WRITE, NULL);
-#endif
         if (tmp3 != tmp2) {
           emith_move_r_r(tmp3, tmp2);
           rcache_free_tmp(tmp2);
@@ -3858,6 +3916,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       case 0x04: // MOV.B Rm,@(R0,Rn)   0000nnnnmmmm0100
       case 0x05: // MOV.W Rm,@(R0,Rn)   0000nnnnmmmm0101
       case 0x06: // MOV.L Rm,@(R0,Rn)   0000nnnnmmmm0110
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         emit_indirect_indexed_write(sh2, GET_Rm(), SHR_R0, GET_Rn(), op & 3);
         goto end_op;
       case 0x07: // MUL.L     Rm,Rn      0000nnnnmmmm0111
@@ -3905,15 +3965,13 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
           if (div(opd).div1 == 16 && div(opd).ro == div(opd).rn) {
             // divide 32/16
             rcache_get_reg_arg(0, div(opd).rn, NULL);
-            rcache_get_reg_arg(1, div(opd).rm, NULL);
+            rcache_get_reg_arg(2, div(opd).rm, NULL);
+            tmp = rcache_get_tmp_arg(1);
+            emith_add_r_r_ptr_imm(tmp, CONTEXT_REG, offsetof(SH2, drc_tmp));
             rcache_invalidate_tmp();
-            emith_call(sh2_drc_divu32);
+            emith_abicall(sh2_drc_divu32);
             tmp = rcache_get_tmp_ret();
-#if REMAP_REGISTER
             tmp2 = rcache_map_reg(div(opd).rn, tmp);
-#else
-            tmp2 = rcache_get_reg(div(opd).rn, RC_GR_WRITE, NULL);
-#endif
             if (tmp != tmp2)
               emith_move_r_r(tmp2, tmp);
 
@@ -3921,26 +3979,25 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
             emith_and_r_r_imm(tmp3, tmp2, 1);     // Q = !Rn[0]
             emith_eor_r_r_imm(tmp3, tmp3, 1);
             emith_or_r_r_lsl(sr, tmp3, Q_SHIFT);
+            emith_ctx_read(tmp3, offsetof(SH2, drc_tmp));
+            emith_or_r_r_r(sr, sr, tmp3);         // T
             rcache_free_tmp(tmp3);
-            emith_or_r_r_r_lsr(sr, sr, tmp2, 31); // T = Rn[31]
             skip_op = div(opd).div1 + div(opd).rotcl;
+            cycles += skip_op;
           }
           else if (div(opd).div1 == 32 && div(opd).ro != div(opd).rn) {
             // divide 64/32
             tmp4 = rcache_get_reg(div(opd).ro, RC_GR_READ, NULL);
             emith_ctx_write(tmp4, offsetof(SH2, drc_tmp));
-            tmp = rcache_get_tmp_arg(1);
-            emith_add_r_r_ptr_imm(tmp, CONTEXT_REG, offsetof(SH2, drc_tmp));
+            rcache_free(tmp4);
             rcache_get_reg_arg(0, div(opd).rn, NULL);
             rcache_get_reg_arg(2, div(opd).rm, NULL);
+            tmp = rcache_get_tmp_arg(1);
+            emith_add_r_r_ptr_imm(tmp, CONTEXT_REG, offsetof(SH2, drc_tmp));
             rcache_invalidate_tmp();
-            emith_call(sh2_drc_divu64);
+            emith_abicall(sh2_drc_divu64);
             tmp = rcache_get_tmp_ret();
-#if REMAP_REGISTER
             tmp2 = rcache_map_reg(div(opd).rn, tmp);
-#else
-            tmp2 = rcache_get_reg(div(opd).rn, RC_GR_WRITE, NULL);
-#endif
             tmp4 = rcache_get_reg(div(opd).ro, RC_GR_WRITE, NULL);
             if (tmp != tmp2)
               emith_move_r_r(tmp2, tmp);
@@ -3951,8 +4008,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
             emith_eor_r_r_imm(tmp3, tmp3, 1);
             emith_or_r_r_lsl(sr, tmp3, Q_SHIFT);
             rcache_free_tmp(tmp3);
-            emith_or_r_r_r_lsr(sr, sr, tmp4, 31); // T = Ro[31]
             skip_op = div(opd).div1 + div(opd).rotcl;
+            cycles += skip_op;
           }
 #endif
           break;
@@ -3986,6 +4043,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       case 0x0c: // MOV.B    @(R0,Rm),Rn      0000nnnnmmmm1100
       case 0x0d: // MOV.W    @(R0,Rm),Rn      0000nnnnmmmm1101
       case 0x0e: // MOV.L    @(R0,Rm),Rn      0000nnnnmmmm1110
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         emit_indirect_indexed_read(sh2, GET_Rn(), SHR_R0, GET_Rm(), (op & 3) | drcf.polling);
         goto end_op;
       case 0x0f: // MAC.L   @Rm+,@Rn+  0000nnnnmmmm1111
@@ -4002,6 +4061,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
 
     /////////////////////////////////////////////
     case 0x01: // MOV.L Rm,@(disp,Rn) 0001nnnnmmmmdddd
+      sr = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+      FLUSH_CYCLES(sr);
       emit_memhandler_write_rr(sh2, GET_Rm(), GET_Rn(), (op & 0x0f) * 4, 2);
       goto end_op;
 
@@ -4011,11 +4072,15 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       case 0x00: // MOV.B Rm,@Rn        0010nnnnmmmm0000
       case 0x01: // MOV.W Rm,@Rn        0010nnnnmmmm0001
       case 0x02: // MOV.L Rm,@Rn        0010nnnnmmmm0010
+        sr = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         emit_memhandler_write_rr(sh2, GET_Rm(), GET_Rn(), 0, op & 3);
         goto end_op;
       case 0x04: // MOV.B Rm,@-Rn       0010nnnnmmmm0100
       case 0x05: // MOV.W Rm,@-Rn       0010nnnnmmmm0101
       case 0x06: // MOV.L Rm,@-Rn       0010nnnnmmmm0110
+        sr = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         emit_memhandler_write_rr(sh2, GET_Rm(), GET_Rn(), 0, (op & 3) | MF_PREDECR);
         goto end_op;
       case 0x07: // DIV0S Rm,Rn         0010nnnnmmmm0111
@@ -4026,19 +4091,16 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
 #if DIV_OPTIMIZER
         if (div(opd).div1 == 16 && div(opd).ro == div(opd).rn) {
           // divide 32/16
-          rcache_get_reg_arg(0, div(opd).rn, NULL);
-          tmp2 = rcache_get_reg_arg(1, div(opd).rm, NULL);
-          tmp3 = rcache_get_tmp();
+          tmp = rcache_get_reg_arg(0, div(opd).rn, NULL);
+          tmp2 = rcache_get_reg_arg(2, div(opd).rm, NULL);
+          tmp3 = rcache_get_tmp_arg(1);
           emith_lsr(tmp3, tmp2, 31);
           emith_or_r_r_lsl(sr, tmp3, M_SHIFT);        // M = Rm[31]
+          emith_add_r_r_ptr_imm(tmp3, CONTEXT_REG, offsetof(SH2, drc_tmp));
           rcache_invalidate_tmp();
-          emith_call(sh2_drc_divs32);
+          emith_abicall(sh2_drc_divs32);
           tmp = rcache_get_tmp_ret();
-#if REMAP_REGISTER
           tmp2 = rcache_map_reg(div(opd).rn, tmp);
-#else
-          tmp2 = rcache_get_reg(div(opd).rn, RC_GR_WRITE, NULL);
-#endif
           if (tmp != tmp2)
             emith_move_r_r(tmp2, tmp);
           tmp3  = rcache_get_tmp();
@@ -4047,28 +4109,29 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
           emith_and_r_r_imm(tmp3, tmp3, 1);
           emith_eor_r_r_imm(tmp3, tmp3, 1);
           emith_or_r_r_lsl(sr, tmp3, Q_SHIFT);        // Q = !Rn[0]^M
+          emith_ctx_read(tmp3, offsetof(SH2, drc_tmp));
+          emith_or_r_r_r(sr, sr, tmp3);               // T
           rcache_free_tmp(tmp3);
-          emith_or_r_r_r_lsr(sr, sr, tmp2, 31);       // T = Rn[31]
           skip_op = div(opd).div1 + div(opd).rotcl;
+          cycles += skip_op;
         }
         else if (div(opd).div1 == 32 && div(opd).ro != div(opd).rn) {
           // divide 64/32
           tmp4 = rcache_get_reg(div(opd).ro, RC_GR_READ, NULL);
           emith_ctx_write(tmp4, offsetof(SH2, drc_tmp));
-          rcache_get_reg_arg(0, div(opd).rn, NULL);
+          rcache_free(tmp4);
+          tmp  = rcache_get_reg_arg(0, div(opd).rn, NULL);
           tmp2 = rcache_get_reg_arg(2, div(opd).rm, NULL);
           tmp3 = rcache_get_tmp_arg(1);
           emith_lsr(tmp3, tmp2, 31);
-          emith_or_r_r_lsl(sr, tmp3, M_SHIFT);         // M = Rm[31]
+          emith_or_r_r_lsl(sr, tmp3, M_SHIFT);        // M = Rm[31]
+          emith_eor_r_r_lsr(tmp3, tmp, 31);
+          emith_or_r_r(sr, tmp3);                     // T = Rn[31]^M
           emith_add_r_r_ptr_imm(tmp3, CONTEXT_REG, offsetof(SH2, drc_tmp));
           rcache_invalidate_tmp();
-          emith_call(sh2_drc_divs64);
+          emith_abicall(sh2_drc_divs64);
           tmp = rcache_get_tmp_ret();
-#if REMAP_REGISTER
           tmp2 = rcache_map_reg(div(opd).rn, tmp);
-#else
-          tmp2 = rcache_get_reg(div(opd).rn, RC_GR_WRITE, NULL);
-#endif
           tmp4 = rcache_get_reg(div(opd).ro, RC_GR_WRITE, NULL);
           if (tmp != tmp2)
             emith_move_r_r(tmp2, tmp);
@@ -4080,8 +4143,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
           emith_eor_r_r_imm(tmp3, tmp3, 1);
           emith_or_r_r_lsl(sr, tmp3, Q_SHIFT);        // Q = !Ro[0]^M
           rcache_free_tmp(tmp3);
-          emith_or_r_r_r_lsr(sr, sr, tmp4, 31);       // T = Ro[31]
           skip_op = div(opd).div1 + div(opd).rotcl;
+          cycles += skip_op;
         } else
 #endif
         {
@@ -4375,6 +4438,7 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
           EMITH_HINT_COND(DCOND_EQ);
           emith_subf_r_r_imm(tmp, tmp2, 1);
           emith_set_t_cond(sr, DCOND_EQ);
+          emith_or_r_imm(sr, SH2_NO_POLLING);
           goto end_op;
         }
         goto default_;
@@ -4583,6 +4647,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
         {
         case 1: // TAS.B @Rn  0100nnnn00011011
           // XXX: is TAS working on 32X?
+          sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+          FLUSH_CYCLES(sr);
           rcache_get_reg_arg(0, GET_Rn(), NULL);
           tmp = emit_memhandler_read(0);
           sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
@@ -4638,6 +4704,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
 
     /////////////////////////////////////////////
     case 0x05: // MOV.L @(disp,Rm),Rn 0101nnnnmmmmdddd
+      sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+      FLUSH_CYCLES(sr);
       emit_memhandler_read_rr(sh2, GET_Rn(), GET_Rm(), (op & 0x0f) * 4, 2 | drcf.polling);
       goto end_op;
 
@@ -4651,13 +4719,15 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       case 0x04: // MOV.B @Rm+,Rn       0110nnnnmmmm0100
       case 0x05: // MOV.W @Rm+,Rn       0110nnnnmmmm0101
       case 0x06: // MOV.L @Rm+,Rn       0110nnnnmmmm0110
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = ((op & 7) >= 4 && GET_Rn() != GET_Rm()) ? MF_POSTINCR : drcf.polling;
         emit_memhandler_read_rr(sh2, GET_Rn(), GET_Rm(), 0, (op & 3) | tmp);
         goto end_op;
       case 0x03: // MOV    Rm,Rn        0110nnnnmmmm0011
         emit_move_r_r(GET_Rn(), GET_Rm());
         goto end_op;
-      case 0x07 ... 0x0f:
+      default: // 0x07 ... 0x0f
         tmp  = rcache_get_reg(GET_Rm(), RC_GR_READ, NULL);
         tmp2 = rcache_get_reg(GET_Rn(), RC_GR_WRITE, NULL);
         switch (op & 0x0f)
@@ -4736,11 +4806,15 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       {
       case 0x0000: // MOV.B R0,@(disp,Rn)  10000000nnnndddd
       case 0x0100: // MOV.W R0,@(disp,Rn)  10000001nnnndddd
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = (op & 0x100) >> 8;
         emit_memhandler_write_rr(sh2, SHR_R0, GET_Rm(), (op & 0x0f) << tmp, tmp);
         goto end_op;
       case 0x0400: // MOV.B @(disp,Rm),R0  10000100mmmmdddd
       case 0x0500: // MOV.W @(disp,Rm),R0  10000101mmmmdddd
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = (op & 0x100) >> 8;
         emit_memhandler_read_rr(sh2, SHR_R0, GET_Rm(), (op & 0x0f) << tmp, tmp | drcf.polling);
         goto end_op;
@@ -4761,12 +4835,16 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
       case 0x0000: // MOV.B R0,@(disp,GBR)   11000000dddddddd
       case 0x0100: // MOV.W R0,@(disp,GBR)   11000001dddddddd
       case 0x0200: // MOV.L R0,@(disp,GBR)   11000010dddddddd
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = (op & 0x300) >> 8;
         emit_memhandler_write_rr(sh2, SHR_R0, SHR_GBR, (op & 0xff) << tmp, tmp);
         goto end_op;
       case 0x0400: // MOV.B @(disp,GBR),R0   11000100dddddddd
       case 0x0500: // MOV.W @(disp,GBR),R0   11000101dddddddd
       case 0x0600: // MOV.L @(disp,GBR),R0   11000110dddddddd
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = (op & 0x300) >> 8;
         emit_memhandler_read_rr(sh2, SHR_R0, SHR_GBR, (op & 0xff) << tmp, tmp | drcf.polling);
         goto end_op;
@@ -4794,6 +4872,8 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
         }
         goto end_op;
       case 0x0c00: // TST.B #imm,@(R0,GBR)  11001100iiiiiiii
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = emit_indirect_indexed_read(sh2, SHR_TMP, SHR_R0, SHR_GBR, 0 | drcf.polling);
         sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
         emith_clr_t_cond(sr);
@@ -4802,16 +4882,22 @@ static void REGPARM(2) *sh2_translate(SH2 *sh2, int tcache_id)
         rcache_free_tmp(tmp);
         goto end_op;
       case 0x0d00: // AND.B #imm,@(R0,GBR)  11001101iiiiiiii
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = emit_indirect_indexed_read(sh2, SHR_TMP, SHR_R0, SHR_GBR, 0);
         tmp2 = rcache_get_tmp_arg(1);
         emith_and_r_r_imm(tmp2, tmp, (op & 0xff));
         goto end_rmw_op;
       case 0x0e00: // XOR.B #imm,@(R0,GBR)  11001110iiiiiiii
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = emit_indirect_indexed_read(sh2, SHR_TMP, SHR_R0, SHR_GBR, 0);
         tmp2 = rcache_get_tmp_arg(1);
         emith_eor_r_r_imm(tmp2, tmp, (op & 0xff));
         goto end_rmw_op;
       case 0x0f00: // OR.B  #imm,@(R0,GBR)  11001111iiiiiiii
+        sr  = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
+        FLUSH_CYCLES(sr);
         tmp = emit_indirect_indexed_read(sh2, SHR_TMP, SHR_R0, SHR_GBR, 0);
         tmp2 = rcache_get_tmp_arg(1);
         emith_or_r_r_imm(tmp2, tmp, (op & 0xff));
@@ -4974,7 +5060,7 @@ end_op:
         // can't resolve branch locally, make a block exit
         bl = dr_prepare_ext_branch(block->entryp, target_pc, sh2->is_slave, tcache_id);
         if (cond != -1) {
-#if 1
+#ifndef __arm__
           if (bl && blx_target_count < ARRAY_SIZE(blx_targets)) {
             // conditional jumps get a blx stub for the far jump
             bl->type = BL_JCCBLX;
@@ -5035,7 +5121,7 @@ end_op:
         emith_move_r_imm_s8_patch(rtsadd, tcache_ptr - (u8 *)rtsret);
 #endif
 
-      // branch not taken, correct cycle count
+      // branch not taken, correct cycle count (now, cycles < 0)
       if (ctaken)
         cycles -= ctaken;
       // set T bit to reflect branch not taken for OP_BRANCH_CT/CF
@@ -5109,7 +5195,7 @@ end_op:
   else
     opd = &ops[i-1];
 
-  if (! OP_ISBRAUC(opd->op))
+  if (! OP_ISBRAUC(opd->op) || (opd->dest & BITMASK1(SHR_PR)))
   {
     tmp = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
     FLUSH_CYCLES(tmp);
@@ -5140,10 +5226,10 @@ end_op:
   // fill blx backup; do this last to backup final patched code
   for (i = 0; i < block->entry_count; i++)
     for (bl = block->entryp[i].o_links; bl; bl = bl->o_next)
-      memcpy(bl->jdisp, bl->blx ?: bl->jump, emith_jump_at_size());
+      memcpy(bl->jdisp, bl->blx ? bl->blx : bl->jump, emith_jump_at_size());
 
   ring_alloc(&tcache_ring[tcache_id], tcache_ptr - block_entry_ptr);
-  host_instructions_updated(block_entry_ptr, tcache_ptr);
+  host_instructions_updated(block_entry_ptr, tcache_ptr, 1);
 
   dr_activate_block(block, tcache_id, sh2->is_slave);
   emith_update_cache();
@@ -5165,10 +5251,6 @@ end_op:
  printf("~~~\n");
 */
 
-#if (DRC_DEBUG)
-  fflush(stdout);
-#endif
-
   return block_entry_ptr;
 }
 
@@ -5183,8 +5265,6 @@ static void sh2_generate_utils(void)
   host_arg2reg(arg1, 1);
   host_arg2reg(arg2, 2);
   host_arg2reg(arg3, 3);
-  emith_move_r_r(arg0, arg0); // nop
-  emith_flush();
 
   // sh2_drc_write8(u32 a, u32 d)
   sh2_drc_write8 = (void *)tcache_ptr;
@@ -5211,12 +5291,12 @@ static void sh2_generate_utils(void)
   emith_sh2_rcall(arg0, arg1, arg2, arg3);
   EMITH_SJMP_START(DCOND_CS);
   emith_and_r_r_c(DCOND_CC, arg0, arg3);
-  emith_eor_r_imm_ptr_c(DCOND_CC, arg0, 1);
+  emit_le_ptr8(DCOND_CC, arg0);
   emith_read8s_r_r_r_c(DCOND_CC, RET_REG, arg2, arg0);
   emith_ret_c(DCOND_CC);
   EMITH_SJMP_END(DCOND_CS);
   emith_move_r_r_ptr(arg1, CONTEXT_REG);
-  emith_jump_reg(arg2);
+  emith_abijump_reg(arg2);
   emith_flush();
 
   // d = sh2_drc_read16(u32 a)
@@ -5230,7 +5310,7 @@ static void sh2_generate_utils(void)
   emith_ret_c(DCOND_CC);
   EMITH_SJMP_END(DCOND_CS);
   emith_move_r_r_ptr(arg1, CONTEXT_REG);
-  emith_jump_reg(arg2);
+  emith_abijump_reg(arg2);
   emith_flush();
 
   // d = sh2_drc_read32(u32 a)
@@ -5241,11 +5321,11 @@ static void sh2_generate_utils(void)
   EMITH_SJMP_START(DCOND_CS);
   emith_and_r_r_c(DCOND_CC, arg0, arg3);
   emith_read_r_r_r_c(DCOND_CC, RET_REG, arg2, arg0);
-  emith_ror_c(DCOND_CC, RET_REG, RET_REG, 16);
+  emit_le_swap(DCOND_CC, RET_REG);
   emith_ret_c(DCOND_CC);
   EMITH_SJMP_END(DCOND_CS);
   emith_move_r_r_ptr(arg1, CONTEXT_REG);
-  emith_jump_reg(arg2);
+  emith_abijump_reg(arg2);
   emith_flush();
 
   // d = sh2_drc_read8_poll(u32 a)
@@ -5255,14 +5335,14 @@ static void sh2_generate_utils(void)
   emith_sh2_rcall(arg0, arg1, arg2, arg3);
   EMITH_SJMP_START(DCOND_CC);
   emith_move_r_r_ptr_c(DCOND_CS, arg1, CONTEXT_REG);
-  emith_jump_reg_c(DCOND_CS, arg2);
+  emith_abijump_reg_c(DCOND_CS, arg2);
   EMITH_SJMP_END(DCOND_CC);
   emith_and_r_r_r(arg1, arg0, arg3);
-  emith_eor_r_imm_ptr(arg1, 1);
+  emit_le_ptr8(-1, arg1);
   emith_read8s_r_r_r(arg1, arg2, arg1);
   emith_push_ret(arg1);
   emith_move_r_r_ptr(arg2, CONTEXT_REG);
-  emith_call(p32x_sh2_poll_memory8);
+  emith_abicall(p32x_sh2_poll_memory8);
   emith_pop_and_ret(arg1);
   emith_flush();
 
@@ -5273,13 +5353,13 @@ static void sh2_generate_utils(void)
   emith_sh2_rcall(arg0, arg1, arg2, arg3);
   EMITH_SJMP_START(DCOND_CC);
   emith_move_r_r_ptr_c(DCOND_CS, arg1, CONTEXT_REG);
-  emith_jump_reg_c(DCOND_CS, arg2);
+  emith_abijump_reg_c(DCOND_CS, arg2);
   EMITH_SJMP_END(DCOND_CC);
   emith_and_r_r_r(arg1, arg0, arg3);
   emith_read16s_r_r_r(arg1, arg2, arg1);
   emith_push_ret(arg1);
   emith_move_r_r_ptr(arg2, CONTEXT_REG);
-  emith_call(p32x_sh2_poll_memory16);
+  emith_abicall(p32x_sh2_poll_memory16);
   emith_pop_and_ret(arg1);
   emith_flush();
 
@@ -5290,14 +5370,14 @@ static void sh2_generate_utils(void)
   emith_sh2_rcall(arg0, arg1, arg2, arg3);
   EMITH_SJMP_START(DCOND_CC);
   emith_move_r_r_ptr_c(DCOND_CS, arg1, CONTEXT_REG);
-  emith_jump_reg_c(DCOND_CS, arg2);
+  emith_abijump_reg_c(DCOND_CS, arg2);
   EMITH_SJMP_END(DCOND_CC);
   emith_and_r_r_r(arg1, arg0, arg3);
   emith_read_r_r_r(arg1, arg2, arg1);
-  emith_ror(arg1, arg1, 16);
+  emit_le_swap(-1, arg1);
   emith_push_ret(arg1);
   emith_move_r_r_ptr(arg2, CONTEXT_REG);
-  emith_call(p32x_sh2_poll_memory32);
+  emith_abicall(p32x_sh2_poll_memory32);
   emith_pop_and_ret(arg1);
   emith_flush();
 
@@ -5330,7 +5410,7 @@ static void sh2_generate_utils(void)
 #endif
   emith_move_r_r_ptr(arg1, CONTEXT_REG);
   emith_add_r_r_ptr_imm(arg2, CONTEXT_REG, offsetof(SH2, drc_tmp));
-  emith_call(dr_lookup_block);
+  emith_abicall(dr_lookup_block);
   // store PC and block entry ptr (in arg0) in branch target cache
   emith_tst_r_r_ptr(RET_REG, RET_REG);
   EMITH_SJMP_START(DCOND_EQ);
@@ -5352,13 +5432,13 @@ static void sh2_generate_utils(void)
   // lookup failed, call sh2_translate()
   emith_move_r_r_ptr(arg0, CONTEXT_REG);
   emith_ctx_read(arg1, offsetof(SH2, drc_tmp)); // tcache_id
-  emith_call(sh2_translate);
+  emith_abicall(sh2_translate);
   emith_tst_r_r_ptr(RET_REG, RET_REG);
   EMITH_SJMP_START(DCOND_EQ);
   emith_jump_reg_c(DCOND_NE, RET_REG);
   EMITH_SJMP_END(DCOND_EQ);
   // XXX: can't translate, fail
-  emith_call(dr_failure);
+  emith_abicall(dr_failure);
   emith_flush();
 
 #if CALL_STACK
@@ -5430,13 +5510,13 @@ static void sh2_generate_utils(void)
   emith_clear_msb(tmp, tmp, 22);
   emith_move_r_r_ptr(arg2, CONTEXT_REG);
   rcache_invalidate_tmp();
-  emith_call(p32x_sh2_write32); // XXX: use sh2_drc_write32?
+  emith_abicall(p32x_sh2_write32); // XXX: use sh2_drc_write32?
   // push PC
   rcache_get_reg_arg(0, SHR_SP, NULL);
   rcache_get_reg_arg(1, SHR_PC, NULL);
   emith_move_r_r_ptr(arg2, CONTEXT_REG);
   rcache_invalidate_tmp();
-  emith_call(p32x_sh2_write32);
+  emith_abicall(p32x_sh2_write32);
   // update I, cycles, do callback
   emith_ctx_read(arg1, offsetof(SH2, pending_level));
   sr = rcache_get_reg(SHR_SR, RC_GR_RMW, NULL);
@@ -5445,7 +5525,7 @@ static void sh2_generate_utils(void)
   emith_sub_r_imm(sr, 13 << 12); // at least 13 cycles
   rcache_flush();
   emith_move_r_r_ptr(arg0, CONTEXT_REG);
-  emith_call_ctx(offsetof(SH2, irq_callback)); // vector = sh2->irq_callback(sh2, level);
+  emith_abicall_ctx(offsetof(SH2, irq_callback)); // vector = sh2->irq_callback(sh2, level);
   // obtain new PC
   tmp = rcache_get_reg_arg(1, SHR_VBR, &tmp2);
   emith_add_r_r_r_lsl(arg0, tmp2, RET_REG, 2);
@@ -5557,7 +5637,7 @@ static void sh2_generate_utils(void)
 #endif
 }
 
-static void sh2_smc_rm_blocks(u32 a, int len, int tcache_id, u32 shift)
+static void sh2_smc_rm_blocks(u32 a, int len, int tcache_id, int free)
 {
   struct block_list **blist, *entry, *next;
   u32 mask = RAM_SIZE(tcache_id) - 1;
@@ -5565,40 +5645,43 @@ static void sh2_smc_rm_blocks(u32 a, int len, int tcache_id, u32 shift)
   u32 start_addr, end_addr;
   u32 start_lit, end_lit;
   struct block_desc *block;
-#if (DRC_DEBUG & 2)
-  int removed = 0;
-#endif
+  int removed = 0, rest;
 
   // ignore cache-through
   a &= wtmask;
 
-  blist = &inval_lookup[tcache_id][(a & mask) / INVAL_PAGE_SIZE];
-  entry = *blist;
-  // go through the block list for this range
-  while (entry != NULL) {
-    next = entry->next;
-    block = entry->block;
-    start_addr = block->addr & wtmask;
-    end_addr = start_addr + block->size;
-    start_lit = block->addr_lit & wtmask;
-    end_lit = start_lit + block->size_lit;
-    // disable/delete block if it covers the modified address
-    if ((start_addr < a+len && a < end_addr) ||
-        (start_lit < a+len && a < end_lit))
-    {
-      dbg(2, "smc remove @%08x", a);
-      end_addr = (start_lit < a+len && block->size_lit ? a : 0);
-      dr_rm_block_entry(block, tcache_id, end_addr, 0);
-#if (DRC_DEBUG & 2)
-      removed = 1;
-#endif
+  do {
+    blist = &inval_lookup[tcache_id][(a & mask) / INVAL_PAGE_SIZE];
+    entry = *blist;
+    // go through the block list for this range
+    while (entry != NULL) {
+      next = entry->next;
+      block = entry->block;
+      start_addr = block->addr & wtmask;
+      end_addr = start_addr + block->size;
+      start_lit = block->addr_lit & wtmask;
+      end_lit = start_lit + block->size_lit;
+      // disable/delete block if it covers the modified address
+      if ((start_addr < a+len && a < end_addr) ||
+          (start_lit < a+len && a < end_lit))
+      {
+        dbg(2, "smc remove @%08x", a);
+        end_addr = (start_lit < a+len && block->size_lit ? a : 0);
+        dr_rm_block_entry(block, tcache_id, end_addr, free);
+        removed = 1;
+      }
+      entry = next;
     }
-    entry = next;
+    rest = INVAL_PAGE_SIZE - (a & (INVAL_PAGE_SIZE-1));
+    a += rest, len -= rest;
+  } while (len > 0);
+
+  if (!removed) {
+    if (len <= 4)
+      dbg(2, "rm_blocks called @%08x, no work?", _a);
+    return;
   }
-#if (DRC_DEBUG & 2)
-  if (!removed)
-    dbg(2, "rm_blocks called @%08x, no work?", a);
-#endif
+
 #if BRANCH_CACHE
   if (tcache_id)
     memset32(sh2s[tcache_id-1].branch_cache, -1, sizeof(sh2s[0].branch_cache)/4);
@@ -5621,12 +5704,12 @@ static void sh2_smc_rm_blocks(u32 a, int len, int tcache_id, u32 shift)
 
 void sh2_drc_wcheck_ram(u32 a, unsigned len, SH2 *sh2)
 {
-  sh2_smc_rm_blocks(a, len, 0, SH2_DRCBLK_RAM_SHIFT);
+  sh2_smc_rm_blocks(a, len, 0, 0);
 }
 
 void sh2_drc_wcheck_da(u32 a, unsigned len, SH2 *sh2)
 {
-  sh2_smc_rm_blocks(a, len, 1 + sh2->is_slave, SH2_DRCBLK_DA_SHIFT);
+  sh2_smc_rm_blocks(a, len, 1 + sh2->is_slave, 0);
 }
 
 int sh2_execute_drc(SH2 *sh2c, int cycles)
@@ -5637,19 +5720,27 @@ int sh2_execute_drc(SH2 *sh2c, int cycles)
   // bit11 contains T saved for delay slot
   // others are usual SH2 flags
   sh2c->sr &= 0x3f3;
-  sh2c->sr |= cycles << 12;
+  sh2c->sr |= (cycles-1) << 12;
+#if (DRC_DEBUG & 8)
+  lastpc = lastcnt = 0;
+#endif
 
   sh2c->state |= SH2_IN_DRC;
-  sh2_drc_entry(sh2c);
+  host_call(sh2_drc_entry, (SH2 *))(sh2c);
   sh2c->state &= ~SH2_IN_DRC;
 
   // TODO: irq cycles
   ret_cycles = (int32_t)sh2c->sr >> 12;
-  if (ret_cycles > 0)
+  if (ret_cycles >= 0)
     dbg(1, "warning: drc returned with cycles: %d, pc %08x", ret_cycles, sh2c->pc);
+#if (DRC_DEBUG & 8)
+  if (lastcnt)
+    dbg(8, "= %csh2 enter %08x %p (%d times), c=%d", sh2c->is_slave?'s':'m',
+      lastpc, lastblock, lastcnt, (signed int)sh2c->sr >> 12);
+#endif
 
   sh2c->sr &= 0x3f3;
-  return ret_cycles;
+  return ret_cycles+1;
 }
 
 static void block_stats(void)
@@ -5678,7 +5769,7 @@ static void block_stats(void)
     }
     if (maxb == NULL)
       break;
-    printf("%08x %p %9d %2.3f%%\n", maxb->addr, maxb->tcache_ptr, maxb->refcount,
+    printf("%08lx %p %9d %2.3f%%\n", (ulong)maxb->addr, maxb->tcache_ptr, maxb->refcount,
       (double)maxb->refcount / total * 100.0);
     maxb->refcount = 0;
   }
@@ -5719,7 +5810,7 @@ void entry_stats(void)
     }
     if (maxb == NULL)
       break;
-    printf("%08x %p %9d %2.3f%%\n", maxb->pc, maxb->tcache_ptr, maxb->entry_count,
+    printf("%08lx %p %9d %2.3f%%\n", (ulong)maxb->pc, maxb->tcache_ptr, maxb->entry_count,
       (double)100 * maxb->entry_count / total);
     maxb->entry_count = 0;
   }
@@ -5751,25 +5842,25 @@ static void state_dump(void)
   int i;
 
   SH2_DUMP(&sh2s[0], "master");
-  printf("VBR msh2: %x\n", sh2s[0].vbr);
+  printf("VBR msh2: %lx\n", (ulong)sh2s[0].vbr);
   for (i = 0; i < 0x60; i++) {
-    printf("%08x ",p32x_sh2_read32(sh2s[0].vbr + i*4, &sh2s[0]));
+    printf("%08lx ",(ulong)p32x_sh2_read32(sh2s[0].vbr + i*4, &sh2s[0]));
     if ((i+1) % 8 == 0) printf("\n");
   }
-  printf("stack msh2: %x\n", sh2s[0].r[15]);
+  printf("stack msh2: %lx\n", (ulong)sh2s[0].r[15]);
   for (i = -0x30; i < 0x30; i++) {
-    printf("%08x ",p32x_sh2_read32(sh2s[0].r[15] + i*4, &sh2s[0]));
+    printf("%08lx ",(ulong)p32x_sh2_read32(sh2s[0].r[15] + i*4, &sh2s[0]));
     if ((i+1) % 8 == 0) printf("\n");
   }
   SH2_DUMP(&sh2s[1], "slave");
-  printf("VBR ssh2: %x\n", sh2s[1].vbr);
+  printf("VBR ssh2: %lx\n", (ulong)sh2s[1].vbr);
   for (i = 0; i < 0x60; i++) {
-    printf("%08x ",p32x_sh2_read32(sh2s[1].vbr + i*4, &sh2s[1]));
+    printf("%08lx ",(ulong)p32x_sh2_read32(sh2s[1].vbr + i*4, &sh2s[1]));
     if ((i+1) % 8 == 0) printf("\n");
   }
-  printf("stack ssh2: %x\n", sh2s[1].r[15]);
+  printf("stack ssh2: %lx\n", (ulong)sh2s[1].r[15]);
   for (i = -0x30; i < 0x30; i++) {
-    printf("%08x ",p32x_sh2_read32(sh2s[1].r[15] + i*4, &sh2s[1]));
+    printf("%08lx ",(ulong)p32x_sh2_read32(sh2s[1].r[15] + i*4, &sh2s[1]));
     if ((i+1) % 8 == 0) printf("\n");
   }
 #endif
@@ -5785,11 +5876,11 @@ static void bcache_stats(void)
 
   printf("return cache hits:%d misses:%d depth: %d index: %d/%d\n", rchit, rcmiss, i,sh2s[0].rts_cache_idx,sh2s[1].rts_cache_idx);
   for (i = 0; i < ARRAY_SIZE(sh2s[0].rts_cache); i++) {
-    printf("%08x ",sh2s[0].rts_cache[i].pc);
+    printf("%08lx ",(ulong)sh2s[0].rts_cache[i].pc);
     if ((i+1) % 8 == 0) printf("\n");
   }
   for (i = 0; i < ARRAY_SIZE(sh2s[1].rts_cache); i++) {
-    printf("%08x ",sh2s[1].rts_cache[i].pc);
+    printf("%08lx ",(ulong)sh2s[1].rts_cache[i].pc);
     if ((i+1) % 8 == 0) printf("\n");
   }
 #endif
@@ -5797,12 +5888,12 @@ static void bcache_stats(void)
   printf("branch cache hits:%d misses:%d\n", bchit, bcmiss);
   printf("branch cache master:\n");
   for (i = 0; i < ARRAY_SIZE(sh2s[0].branch_cache); i++) {
-    printf("%08x ",sh2s[0].branch_cache[i].pc);
+    printf("%08lx ",(ulong)sh2s[0].branch_cache[i].pc);
     if ((i+1) % 8 == 0) printf("\n");
   }
   printf("branch cache slave:\n");
   for (i = 0; i < ARRAY_SIZE(sh2s[1].branch_cache); i++) {
-    printf("%08x ",sh2s[1].branch_cache[i].pc);
+    printf("%08lx ",(ulong)sh2s[1].branch_cache[i].pc);
     if ((i+1) % 8 == 0) printf("\n");
   }
 #endif
@@ -5879,7 +5970,7 @@ int sh2_drc_init(SH2 *sh2)
 
     tcache_ptr = tcache;
     sh2_generate_utils();
-    host_instructions_updated(tcache, tcache_ptr);
+    host_instructions_updated(tcache, tcache_ptr, 1);
     emith_update_cache();
 
     i = tcache_ptr - tcache;
@@ -5895,7 +5986,6 @@ int sh2_drc_init(SH2 *sh2)
     // disasm the utils
     tcache_dsm_ptrs[0] = tcache;
     do_host_disasm(0);
-    fflush(stdout);
 #endif
 #if (DRC_DEBUG & 1)
     hash_collisions = 0;
@@ -5968,6 +6058,11 @@ void sh2_drc_finish(SH2 *sh2)
     if (hash_tables[i] != NULL) {
       free(hash_tables[i]);
       hash_tables[i] = NULL;
+    }
+
+    if (unresolved_links[i] != NULL) {
+      free(unresolved_links[i]);
+      unresolved_links[i] = NULL;
     }
   }
 
@@ -6171,6 +6266,7 @@ u16 scan_block(u32 base_pc, int is_slave, u8 *op_flags, u32 *end_pc_out,
           break;
         case 1: // SLEEP      0000000000011011
           opd->op = OP_SLEEP;
+          opd->cycles = 3;
           end_block = 1;
           break;
         case 2: // RTE        0000000000101011
@@ -6847,7 +6943,7 @@ end:
 
   // 2nd pass: some analysis
   lowest_literal = end_literals = lowest_mova = 0;
-  t = T_UNKNOWN;
+  t = T_UNKNOWN; // T flag state
   last_btarget = 0;
   op = 0; // delay/poll insns counter
   is_divop = 0; // divide op insns counter
@@ -6857,7 +6953,7 @@ end:
     crc += FETCH_OP(pc);
 
     // propagate T (TODO: DIV0U)
-    if ((op_flags[i] & OF_BTARGET) || (opd->dest & BITMASK1(SHR_T)))
+    if (op_flags[i] & OF_BTARGET)
       t = T_UNKNOWN;
 
     if ((opd->op == OP_BRANCH_CT && t == T_SET) ||
@@ -6867,10 +6963,12 @@ end:
     } else if ((opd->op == OP_BRANCH_CT && t == T_CLEAR) ||
                (opd->op == OP_BRANCH_CF && t == T_SET))
       opd->op = OP_BRANCH_N;
-    else if ((opd->op == OP_SETCLRT && !opd->imm) || opd->op == OP_BRANCH_CT)
-      t = T_CLEAR;
-    else if ((opd->op == OP_SETCLRT && opd->imm) || opd->op == OP_BRANCH_CF)
-      t = T_SET;
+    else if (OP_ISBRACND(opd->op))
+      t = (opd->op == OP_BRANCH_CF ? T_SET : T_CLEAR);
+    else if (opd->op == OP_SETCLRT)
+      t = (opd->imm ? T_SET : T_CLEAR);
+    else if (opd->dest & BITMASK1(SHR_T))
+      t = T_UNKNOWN;
 
     // "overscan" detection: unreachable code after unconditional branch
     // this can happen if the insn after a forward branch isn't a local target
@@ -6987,9 +7085,9 @@ end:
 
   *end_pc_out = end_pc;
   if (base_literals_out != NULL)
-    *base_literals_out = (lowest_literal ?: end_pc);
+    *base_literals_out = (lowest_literal ? lowest_literal : end_pc);
   if (end_literals_out != NULL)
-    *end_literals_out = (end_literals ?: end_pc);
+    *end_literals_out = (end_literals ? end_literals : end_pc);
 
   // crc overflow handling, twice to collect all overflows
   crc = (crc & 0xffff) + (crc >> 16);

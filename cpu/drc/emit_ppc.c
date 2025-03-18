@@ -1,6 +1,6 @@
 /*
  * Basic macros to emit PowerISA 2.03 64 bit instructions and some utils
- * Copyright (C) 2020 kub
+ * Copyright (C) 2020-2024 irixxxx
  *
  * This work is licensed under the terms of MAME license.
  * See COPYING file in the top-level directory.
@@ -38,17 +38,21 @@
 
 // PPC64: params: r3-r10, return: r3, temp: r0,r11-r12, saved: r14-r31
 // reserved: r0(zero), r1(stack), r2(TOC), r13(TID)
+// additionally reserved on OSX: r31(PIC), r30(frame), r11(parentframe)
+// for OSX PIC code, on function calls r12 must contain the called address
+#define TOC_REG		2
 #define RET_REG		3
 #define PARAM_REGS	{ 3, 4, 5, 6, 7, 8, 9, 10 }
-#define PRESERVED_REGS	{ 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 }
-#define TEMPORARY_REGS	{ 11, 12 }
+#define PRESERVED_REGS	{ 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 }
+#define TEMPORARY_REGS	{ 12 }
 
-#define CONTEXT_REG	31
-#define STATIC_SH2_REGS	{ SHR_SR,30 , SHR_R(0),29 , SHR_R(1),28 }
+#define CONTEXT_REG	29
+#define STATIC_SH2_REGS	{ SHR_SR,28 , SHR_R(0),27 , SHR_R(1),26 }
 
 // if RA is 0 in non-update memory insns, ADDI/ADDIS, ISEL, it aliases with zero
 #define Z0		0  // zero register
 #define SP		1  // stack pointer
+#define CR		12 // call register
 // SPR registers
 #define XER		-1 // exception register
 #define LR		-8 // link register
@@ -160,15 +164,13 @@ enum { OPS_STD, OPS_STDU /*,OPS_STQ*/ };
 #define PPC_ADD_REG(rt, ra, rb) \
 	PPC_OP_REG(OP__EXT,OPE_ADD,rt,ra,rb)
 #define PPC_ADDC_REG(rt, ra, rb) \
-	PPC_OP_REG(OP__EXT,OPE_ADD|XOE,rt,ra,rb)
+	PPC_OP_REG(OP__EXT,OPE_ADDC,rt,ra,rb)
 #define PPC_SUB_REG(rt, rb, ra) /* NB reversed args (rb-ra) */ \
 	PPC_OP_REG(OP__EXT,OPE_SUBF,rt,ra,rb)
 #define PPC_SUBC_REG(rt, rb, ra) \
-	PPC_OP_REG(OP__EXT,OPE_SUBF|XOE,rt,ra,rb)
+	PPC_OP_REG(OP__EXT,OPE_SUBFC,rt,ra,rb)
 #define PPC_NEG_REG(rt, ra) \
 	PPC_OP_REG(OP__EXT,OPE_NEG,rt,ra,_)
-#define PPC_NEGC_REG(rt, ra) \
-	PPC_OP_REG(OP__EXT,OPE_NEG|XOE,rt,ra,_)
 
 #define PPC_CMP_REG(ra, rb) \
 	PPC_OP_REG(OP__EXT,OPE_CMP,1,ra,rb)
@@ -361,6 +363,11 @@ enum { OPS_STD, OPS_STDU /*,OPS_STQ*/ };
 #define	PPC_STB_IMM(rt, ra, offs16) \
 	PPC_OP_IMM(OP_STB,rt,ra,(u16)(offs16))
 
+#define	PPC_STXU_IMM(rt, ra, offs16) \
+	PPC_OP_IMM(OP__ST,rt,ra,((u16)(offs16)&~3)|OPS_STDU)
+#define	PPC_STWU_IMM(rt, ra, offs16) \
+	PPC_OP_IMM(OP_STWU,rt,ra,(u16)(offs16))
+
 // load/store, indexed
 
 #define PPC_LDX_REG(rt, ra, rb) \
@@ -406,29 +413,26 @@ enum { OPS_STD, OPS_STDU /*,OPS_STQ*/ };
 #define PPC_LDP_REG			PPC_LDX_REG
 #define PPC_STP_IMM			PPC_STX_IMM
 #define PPC_STP_REG			PPC_STX_REG
+#define PPC_STPU_IMM			PPC_STXU_IMM
 #define PPC_BFXP_IMM			PPC_BFX_IMM
 
 #define emith_uext_ptr(r)		EMIT(PPC_EXTUW_REG(r, r))
 
 // "long" multiplication, 32x32 bit = 64 bit
 #define EMIT_PPC_MULLU_REG(dlo, dhi, s1, s2) do { \
-	EMIT(PPC_EXTUW_REG(s1, s1)); \
-	EMIT(PPC_EXTUW_REG(s2, s2)); \
-	EMIT(PPC_MULL(dlo, s1, s2)); \
-	EMIT(PPC_ASR_IMM(dhi, dlo, 32)); \
+	int at = (dlo == s1 || dlo == s2 ? AT : dlo); \
+	EMIT(PPC_MUL(at, s1, s2)); \
+	EMIT(PPC_MULHU(dhi, s1, s2)); \
+	if (at != dlo) emith_move_r_r(dlo, at); \
 } while (0)
 
 #define EMIT_PPC_MULLS_REG(dlo, dhi, s1, s2) do { \
-	EMIT(PPC_EXTSW_REG(s1, s1)); \
-	EMIT(PPC_EXTSW_REG(s2, s2)); \
-	EMIT(PPC_MULL(dlo, s1, s2)); \
+	EMIT(PPC_MUL(dlo, s1, s2)); \
 	EMIT(PPC_ASR_IMM(dhi, dlo, 32)); \
 } while (0)
 
 #define EMIT_PPC_MACLS_REG(dlo, dhi, s1, s2) do { \
-	EMIT(PPC_EXTSW_REG(s1, s1)); \
-	EMIT(PPC_EXTSW_REG(s2, s2)); \
-	EMIT(PPC_MULL(AT, s1, s2)); \
+	EMIT(PPC_MUL(AT, s1, s2)); \
 	EMIT(PPC_BFI_IMM(dlo, dhi, 0, 32)); \
 	emith_add_r_r(dlo, AT); \
 	EMIT(PPC_ASR_IMM(dhi, dlo, 32)); \
@@ -439,6 +443,7 @@ enum { OPS_STD, OPS_STDU /*,OPS_STQ*/ };
 #define PPC_LDP_REG			PPC_LDW_REG
 #define PPC_STP_IMM			PPC_STW_IMM
 #define PPC_STP_REG			PPC_STW_REG
+#define PPC_STPU_IMM			PPC_STWU_IMM
 #define PPC_BFXP_IMM			PPC_BFXW_IMM
 
 #define emith_uext_ptr(r)		/**/
@@ -1299,14 +1304,25 @@ static void emith_add_imm(int rt, int ra, u32 imm)
 	if (_s) emith_add_r_r_ptr_imm(SP, SP, _s); \
 } while (0)
 
+#if defined __PS3__
+// on PS3 a C function pointer points to an array of 2 ptrs containing the start
+// address and the TOC pointer for this function. TOC isn't used by the DRC though.
+static void *fptr[2];
+#define host_call(addr, args)	(fptr[0] = addr, (void (*) args)fptr)
+#else
+// with ELF we have the PLT which wraps functions needing any ABI register setup,
+// hence a function ptr is simply the entry address of the function to execute.
+#define host_call(addr, args)	addr
+#endif
+
 #define host_arg2reg(rt, arg) \
 	rt = (arg+3)
 
 #define emith_pass_arg_r(arg, reg) \
-	emith_move_r_r(arg, reg)
+	emith_move_r_r_ptr(arg, reg)
 
 #define emith_pass_arg_imm(arg, imm) \
-	emith_move_r_imm(arg, imm)
+	emith_move_r_ptr_imm(arg, imm)
 
 // branching
 #define emith_invert_branch(cond) /* inverted conditional branch */ \
@@ -1441,7 +1457,7 @@ static int emith_cond_check(int cond)
 
 #define emith_jump_cond_inrange(target) \
 	((u8 *)target - (u8 *)tcache_ptr <   0x8000 && \
-	 (u8 *)target - (u8 *)tcache_ptr >= -0x8000+0x10) //mind cond_check
+	 (u8 *)target - (u8 *)tcache_ptr >= -0x8000+0x14) //mind cond_check
 
 // NB: returns position of patch for cache maintenance
 #define emith_jump_patch(ptr, target, pos) do { \
@@ -1474,8 +1490,8 @@ static int emith_cond_check(int cond)
 	emith_jump_reg(r)
 
 #define emith_jump_ctx(offs) do { \
-	emith_ctx_read_ptr(AT, offs); \
-	emith_jump_reg(AT); \
+	emith_ctx_read_ptr(CR, offs); \
+	emith_jump_reg(CR); \
 } while (0)
 #define emith_jump_ctx_c(cond, offs) \
 	emith_jump_ctx(offs)
@@ -1492,10 +1508,40 @@ static int emith_cond_check(int cond)
 	EMIT(PPC_BLCTRCOND(BXX)); \
 } while(0)
 
-#define emith_call_ctx(offs) do { \
-	emith_ctx_read_ptr(AT, offs); \
-	emith_call_reg(AT); \
+#define emith_abicall_ctx(offs) do { \
+	emith_ctx_read_ptr(CR, offs); \
+	emith_abicall_reg(CR); \
 } while (0)
+
+#ifdef __PS3__
+#define emith_abijump_reg(r) \
+	emith_read_r_r_offs_ptr(TOC_REG, r, PTR_SIZE); \
+	emith_read_r_r_offs_ptr(CR, r, 0); \
+	emith_jump_reg(CR)
+#else
+#define emith_abijump_reg(r) \
+	if ((r) != CR) emith_move_r_r(CR, r); \
+	emith_jump_reg(CR)
+#endif
+#define emith_abijump_reg_c(cond, r) \
+	emith_abijump_reg(r)
+#define emith_abicall(target) \
+	emith_move_r_ptr_imm(CR, target); \
+	emith_abicall_reg(CR);
+#define emith_abicall_cond(cond, target) \
+	emith_abicall(target)
+#ifdef __PS3__
+#define emith_abicall_reg(r) do { \
+	emith_read_r_r_offs_ptr(TOC_REG, r, PTR_SIZE); \
+	emith_read_r_r_offs_ptr(CR, r, 0); \
+	emith_call_reg(CR); \
+} while(0)
+#else
+#define emith_abicall_reg(r) do { \
+	if ((r) != CR) emith_move_r_r(CR, r); \
+	emith_call_reg(CR); \
+} while(0)
+#endif
 
 #define emith_call_cleanup()	/**/
 
@@ -1533,12 +1579,38 @@ static int emith_cond_check(int cond)
 } while (0)
 
 
+// this should normally be in libc clear_cache; however, it sometimes isn't.
+static NOINLINE void host_instructions_updated(void *base, void *end, int force)
+{
+	int step = 32, lgstep = 5;
+	char *_base = (char *)((uptr)base & ~(step-1));
+	int count = (((char *)end - _base) >> lgstep) + 1;
+
+	if (count <= 0) count = 1;	// make sure count is positive
+	base = _base;
+
+	asm volatile(
+	"	mtctr	%1;"
+	"0:	dcbst	0,%0;"
+	"	add	%0, %0, %2;"
+	"	bdnz	0b;"
+	"	sync"
+	: "+r"(_base) : "r"(count), "r"(step) : "ctr");
+
+	asm volatile(
+	"	mtctr	%1;"
+	"0:	icbi	0,%0;"
+	"	add	%0, %0, %2;"
+	"	bdnz	0b;"
+	"	isync"
+	: "+r"(base) : "r"(count), "r"(step) : "ctr");
+}
+
 // emitter ABI stuff
 #define emith_pool_check()	/**/
 #define emith_pool_commit(j)	/**/
 #define emith_insn_ptr()	((u8 *)tcache_ptr)
 #define emith_flush()		/**/
-#define host_instructions_updated(base, end) __builtin___clear_cache(base, end)
 #define emith_update_cache()	/**/
 #define emith_rw_offs_max()	0x7fff
 
@@ -1547,25 +1619,24 @@ static int emith_cond_check(int cond)
 #define emith_sh2_drc_entry() do { \
 	int _c, _z = PTR_SIZE; u32 _m = 0xffffc000; /* r14-r31 */ \
 	if (__builtin_parity(_m) == 1) _m |= 0x1; /* ABI align for SP is 16 */ \
-	int _s = count_bits(_m) * _z, _o = 0; \
-	for (_c = HOST_REGS-1; _m && _c >= 0; _m &= ~(1 << _c), _c--) \
+	int _s = count_bits(_m) * _z, _o = STACK_EXTRA; \
+	EMIT(PPC_STPU_IMM(SP, SP, -_s-STACK_EXTRA)); \
+	EMIT(PPC_MFSP_REG(AT, LR)); \
+	for (_c = 0; _m && _c < HOST_REGS; _m &= ~(1 << _c), _c++) \
 		if (_m & (1 << _c)) \
-			{ _o -= _z; if (_c) emith_write_r_r_offs_ptr(_c, SP, _o); } \
-	EMIT(PPC_MFSP_REG(10, LR)); \
-	emith_write_r_r_offs_ptr(10, SP, 2*PTR_SIZE); \
-	emith_write_r_r_offs_ptr(SP, SP, -_s-STACK_EXTRA); /* XXX stdu */ \
-	emith_add_r_r_ptr_imm(SP, SP, -_s-STACK_EXTRA); \
+			{ if (_c) emith_write_r_r_offs_ptr(_c, SP, _o); _o += _z; } \
+	emith_write_r_r_offs_ptr(AT, SP, _o + _z); \
 } while (0)
 #define emith_sh2_drc_exit() do { \
 	int _c, _z = PTR_SIZE; u32 _m = 0xffffc000; \
 	if (__builtin_parity(_m) == 1) _m |= 0x1; \
 	int _s = count_bits(_m) * _z, _o = STACK_EXTRA; \
+	emith_read_r_r_offs_ptr(AT, SP, _o+_s + _z); \
+	EMIT(PPC_MTSP_REG(AT, LR)); \
 	for (_c = 0; _m && _c < HOST_REGS; _m &= ~(1 << _c), _c++) \
 		if (_m & (1 << _c)) \
 			{ if (_c) emith_read_r_r_offs_ptr(_c, SP, _o); _o += _z; } \
 	emith_add_r_r_ptr_imm(SP, SP, _s+STACK_EXTRA); \
-	emith_read_r_r_offs_ptr(10, SP, 2*PTR_SIZE); \
-	EMIT(PPC_MTSP_REG(10, LR)); \
 	emith_ret(); \
 } while (0)
 
@@ -1584,9 +1655,9 @@ static int emith_cond_check(int cond)
 #define emith_sh2_wcall(a, val, tab, func) do { \
 	emith_lsr(func, a, SH2_WRITE_SHIFT); \
 	emith_lsl(func, func, PTR_SCALE); \
-	emith_read_r_r_r_ptr(func, tab, func); \
+	emith_read_r_r_r_ptr(CR, tab, func); \
 	emith_move_r_r_ptr(5, CONTEXT_REG); /* arg2 */ \
-	emith_jump_reg(func); \
+	emith_abijump_reg(CR); \
 } while (0)
 
 #define emith_sh2_delay_loop(cycles, reg) do {			\
@@ -1599,7 +1670,7 @@ static int emith_cond_check(int cond)
 	EMITH_JMP_START(DCOND_LE);				\
 	/* turns = sr.cycles / cycles */			\
 	emith_asr(t2, sr, 12);					\
-	emith_move_r_imm(t3, (u32)((1ULL<<32) / (cycles)) + 1);	\
+	emith_move_r_imm(t3, (u32)((1ULL<<32) / (cycles)));	\
 	emith_mul_u64(t1, t2, t2, t3); /* multiply by 1/x */	\
 	rcache_free_tmp(t3);					\
 	if (reg >= 0) {						\
@@ -1671,13 +1742,13 @@ static int emith_cond_check(int cond)
 	emith_asr(rn, mh, 15);                    \
 	emith_add_r_r_r_lsr(rn, rn, mh, 31); /* sum = (MACH>>31)+(MACH>>15) */ \
 	emith_tst_r_r(rn, rn); /* (need only N and Z flags) */ \
-	EMITH_SJMP_START(DCOND_EQ); /* sum != 0 -> ov */ \
-	emith_move_r_imm_c(DCOND_NE, ml, 0x0000); /* -overflow */ \
-	emith_move_r_imm_c(DCOND_NE, mh, 0x8000); \
-	EMITH_SJMP_START(DCOND_PL); /* sum > 0 -> +ovl */ \
-	emith_sub_r_imm_c(DCOND_MI, ml, 1); /* 0xffffffff */ \
-	emith_sub_r_imm_c(DCOND_MI, mh, 1); /* 0x00007fff */ \
-	EMITH_SJMP_END(DCOND_PL);                 \
+	EMITH_SJMP_START(DCOND_EQ); /* sum != 0 -> -ovl */ \
+	emith_move_r_imm_c(DCOND_NE, ml, 0x00000000); \
+	emith_move_r_imm_c(DCOND_NE, mh, 0x00008000); \
+	EMITH_SJMP_START(DCOND_MI); /* sum > 0 -> +ovl */ \
+	emith_sub_r_imm_c(DCOND_PL, ml, 1); /* 0xffffffff */ \
+	emith_sub_r_imm_c(DCOND_PL, mh, 1); /* 0x00007fff */ \
+	EMITH_SJMP_END(DCOND_MI);                 \
 	EMITH_SJMP_END(DCOND_EQ);                 \
 	EMITH_SJMP_END(DCOND_EQ);                 \
 } while (0)
@@ -1700,10 +1771,10 @@ static int emith_cond_check(int cond)
 	EMITH_SJMP_START(DCOND_EQ); /* sum != 0 -> overflow */ \
 	/* XXX: LSB signalling only in SH1, or in SH2 too? */ \
 	emith_move_r_imm_c(DCOND_NE, mh, 0x00000001); /* LSB of MACH */ \
-	emith_move_r_imm_c(DCOND_NE, ml, 0x80000000); /* negative ovrfl */ \
-	EMITH_SJMP_START(DCOND_PL); /* sum > 0 -> positive ovrfl */ \
-	emith_sub_r_imm_c(DCOND_MI, ml, 1); /* 0x7fffffff */ \
-	EMITH_SJMP_END(DCOND_PL);                 \
+	emith_move_r_imm_c(DCOND_NE, ml, 0x80000000); /* -ovrfl */ \
+	EMITH_SJMP_START(DCOND_MI); /* sum > 0 -> +ovrfl */ \
+	emith_sub_r_imm_c(DCOND_PL, ml, 1); /* 0x7fffffff */ \
+	EMITH_SJMP_END(DCOND_MI);                 \
 	EMITH_SJMP_END(DCOND_EQ);                 \
 	EMITH_SJMP_END(DCOND_EQ);                 \
 } while (0)

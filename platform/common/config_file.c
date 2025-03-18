@@ -18,17 +18,13 @@
 #include "../libpicofe/lprintf.h"
 #include "config_file.h"
 
-#ifdef USE_LIBRETRO_VFS
-#include "file_stream_transforms.h"
-#endif
-
 static char *mystrip(char *str);
 
 #ifndef _MSC_VER
 
 #include "menu_pico.h"
 #include "emu.h"
-#include <pico/pico.h>
+#include <pico/pico_int.h>
 
 // always output DOS endlines
 #ifdef _WIN32
@@ -57,7 +53,7 @@ static int seek_sect(FILE *f, const char *section)
 	return 0;
 }
 
-static void keys_write(FILE *fn, int dev_id, const int *binds)
+static void keys_write(FILE *fn, int dev_id, const int *binds, const int *kbd_binds)
 {
 	char act[48];
 	int key_count = 0, k, i;
@@ -71,6 +67,8 @@ static void keys_write(FILE *fn, int dev_id, const int *binds)
 		act[0] = act[31] = 0;
 
 		name = in_get_key_name(dev_id, k);
+		if (strcmp(name, "#") == 0) name = "\\x23"; // replace comment sign
+		if (strcmp(name, "=") == 0) name = "\\x3d"; // replace assignment sign
 
 		for (i = 0; me_ctrl_actions[i].name != NULL; i++) {
 			mask = me_ctrl_actions[i].mask;
@@ -85,6 +83,19 @@ static void keys_write(FILE *fn, int dev_id, const int *binds)
 			}
 		}
 
+		for (i = 0; me_ctrl_actions[i].name != NULL; i++) {
+			mask = me_ctrl_actions[i].mask;
+			if (mask & binds[IN_BIND_OFFS(k, IN_BINDTYPE_PLAYER34)]) {
+				strncpy(act, me_ctrl_actions[i].name, 31);
+				fprintf(fn, "bind %s = player3 %s" NL, name, mystrip(act));
+			}
+			mask = me_ctrl_actions[i].mask << 16;
+			if (mask & binds[IN_BIND_OFFS(k, IN_BINDTYPE_PLAYER34)]) {
+				strncpy(act, me_ctrl_actions[i].name, 31);
+				fprintf(fn, "bind %s = player4 %s" NL, name, mystrip(act));
+			}
+		}
+
 		for (i = 0; emuctrl_actions[i].name != NULL; i++) {
 			mask = emuctrl_actions[i].mask;
 			if (mask & binds[IN_BIND_OFFS(k, IN_BINDTYPE_EMU)]) {
@@ -92,6 +103,14 @@ static void keys_write(FILE *fn, int dev_id, const int *binds)
 				fprintf(fn, "bind %s = %s" NL, name, mystrip(act));
 			}
 		}
+	}
+
+	for (k = 0; k < key_count; k++) {
+		const char *name = in_get_key_name(dev_id, k);
+		if (strcmp(name, "#") == 0) name = "\\x23"; // replace comment sign
+		if (strcmp(name, "=") == 0) name = "\\x3d"; // replace assignment sign
+		if (kbd_binds[k])
+			fprintf(fn, "bind %s = key%02x" NL, name, kbd_binds[k]);
 	}
 }
 
@@ -109,7 +128,7 @@ int config_write(const char *fname)
 	for (me = me_list_get_first(); me != NULL; me = me_list_get_next())
 	{
 		int dummy;
-		if (!me->need_to_save || !me->enabled)
+		if (!me->need_to_save)
 			continue;
 		if (me->name == NULL || me->name[0] == 0)
 			continue;
@@ -120,21 +139,26 @@ int config_write(const char *fname)
 		else if (me->beh == MB_OPT_RANGE || me->beh == MB_OPT_CUSTRANGE) {
 			fprintf(fn, "%s = %i" NL, me->name, *(int *)me->var);
 		}
-		else if (me->beh == MB_OPT_ENUM && me->data != NULL) {
+		else if (me->beh == MB_OPT_ENUM) {
 			const char **names = (const char **)me->data;
+			if (names == NULL)
+				continue;
 			for (t = 0; names[t] != NULL; t++) {
 				if (*(int *)me->var == t) {
-					strncpy(line, names[t], sizeof(line));
+					strncpy(line, names[t], sizeof(line)-1);
+					line[sizeof(line)-1] = '\0';
 					goto write_line;
 				}
 			}
 		}
 		else if (me->generate_name != NULL) {
-			strncpy(line, me->generate_name(0, &dummy), sizeof(line));
+			strncpy(line, me->generate_name(me->id, &dummy), sizeof(line)-1);
+			line[sizeof(line)-1] = '\0';
 			goto write_line;
 		}
 		else
-			lprintf("config: unhandled write: %i\n", me->id);
+			lprintf("config: unhandled write: '%s' id %d behavior %d\n",
+				me->name, me->id, me->beh);
 		continue;
 
 write_line:
@@ -156,7 +180,7 @@ write_line:
 		fprintf(fn, "binddev = %s" NL, name);
 
 		in_get_config(t, IN_CFG_BIND_COUNT, &count);
-		keys_write(fn, t, binds);
+		keys_write(fn, t, binds, in_get_dev_kbd_binds(t));
 	}
 
 	fprintf(fn, "Sound Volume = %i" NL, currentConfig.volume);
@@ -238,9 +262,9 @@ int config_readlrom(const char *fname)
 		tmp++;
 		mystrip(tmp);
 
-		len = sizeof(rom_fname_loaded);
+		len = sizeof(rom_fname_loaded)-1;
 		strncpy(rom_fname_loaded, tmp, len);
-		rom_fname_loaded[len-1] = 0;
+		rom_fname_loaded[len] = 0;
 		ret = 0;
 		break;
 	}
@@ -264,8 +288,13 @@ static int custom_read(menu_entry *me, const char *var, const char *val)
 		case MA_OPT_SOUND_QUALITY:
 			if (strcasecmp(var, "Sound Quality") != 0) return 0;
 			PicoIn.sndRate = strtoul(val, &tmp, 10);
-			if (PicoIn.sndRate < 8000 || PicoIn.sndRate > 44100)
-				PicoIn.sndRate = 22050;
+			if (PicoIn.sndRate < 8000 || PicoIn.sndRate > 54000) {
+				if  (strncasecmp(tmp, "native", 6) == 0) {
+					tmp += 6;
+					PicoIn.sndRate = 53000;
+				} else
+					PicoIn.sndRate = 22050;
+			}
 			if (*tmp == 'H' || *tmp == 'h') tmp++;
 			if (*tmp == 'Z' || *tmp == 'z') tmp++;
 			while (*tmp == ' ') tmp++;
@@ -275,6 +304,11 @@ static int custom_read(menu_entry *me, const char *var, const char *val)
 				PicoIn.opt &= ~POPT_EN_STEREO;
 			} else
 				return 0;
+			return 1;
+
+		case MA_OPT_SOUND_ALPHA:
+			if (strcasecmp(var, "Filter strength") != 0) return 0;
+			PicoIn.sndFilterAlpha = 0x10000 * atof(val);
 			return 1;
 
 		case MA_OPT_REGION:
@@ -330,29 +364,25 @@ static int custom_read(menu_entry *me, const char *var, const char *val)
 			currentConfig.max_skip = atoi(val);
 			return 1;
 
+		case MA_CTRL_KEYBOARD:
+			currentConfig.keyboard = 0;
+			if (strcasecmp(val, "physical") == 0)
+				currentConfig.keyboard = 2;
+			else if (strcasecmp(val, "virtual") == 0)
+				currentConfig.keyboard = 1;
+			return 1;
+
 		/* PSP */
-		case MA_OPT3_SCALE:
-			if (strcasecmp(var, "Scale factor") != 0) return 0;
-			currentConfig.scale = atof(val);
-			return 1;
-		case MA_OPT3_HSCALE32:
-			if (strcasecmp(var, "Hor. scale (for low res. games)") != 0) return 0;
-			currentConfig.hscale32 = atof(val);
-			return 1;
-		case MA_OPT3_HSCALE40:
-			if (strcasecmp(var, "Hor. scale (for hi res. games)") != 0) return 0;
-			currentConfig.hscale40 = atof(val);
-			return 1;
 		case MA_OPT3_VSYNC:
 			// XXX: use enum
 			if (strcasecmp(var, "Wait for vsync") != 0) return 0;
 			if        (strcasecmp(val, "never") == 0) {
-				currentConfig.EmuOpt &= ~0x12000;
+				currentConfig.EmuOpt &= ~(EOPT_VSYNC|EOPT_VSYNC_MODE);
 			} else if (strcasecmp(val, "sometimes") == 0) {
-				currentConfig.EmuOpt |=  0x12000;
+				currentConfig.EmuOpt |=  (EOPT_VSYNC|EOPT_VSYNC_MODE);
 			} else if (strcasecmp(val, "always") == 0) {
-				currentConfig.EmuOpt &= ~0x12000;
-				currentConfig.EmuOpt |=  0x02000;
+				currentConfig.EmuOpt &= ~EOPT_VSYNC_MODE;
+				currentConfig.EmuOpt |=  EOPT_VSYNC;
 			} else
 				return 0;
 			return 1;
@@ -371,17 +401,23 @@ static int parse_bind_val(const char *val, int *type)
 	if (val[0] == 0)
 		return 0;
 	
+	if (strncasecmp(val, "key", 3) == 0)
+	{
+		*type = IN_BINDTYPE_KEYBOARD;
+		return strtol(val + 3, NULL, 16);
+	}
+
 	if (strncasecmp(val, "player", 6) == 0)
 	{
 		int player, shift = 0;
 		player = atoi(val + 6) - 1;
 
-		if (player > 1)
+		if (player > 3)
 			return -1;
-		if (player == 1)
+		if (player & 1)
 			shift = 16;
 
-		*type = IN_BINDTYPE_PLAYER12;
+		*type = IN_BINDTYPE_PLAYER12 + (player >> 1);
 		for (i = 0; me_ctrl_actions[i].name != NULL; i++) {
 			if (strncasecmp(me_ctrl_actions[i].name, val + 8, strlen(val + 8)) == 0)
 				return me_ctrl_actions[i].mask << shift;
@@ -399,7 +435,7 @@ static int parse_bind_val(const char *val, int *type)
 
 static void keys_parse_all(FILE *f)
 {
-	char line[256], *var, *val;
+	char line[640], *var, *val;
 	int dev_id = -1;
 	int acts, type;
 	int ret;
@@ -429,8 +465,12 @@ static void keys_parse_all(FILE *f)
 		}
 
 		mystrip(var + 5);
-		in_config_bind_key(dev_id, var + 5, acts, type);
+		if (type == IN_BINDTYPE_KEYBOARD)
+			in_config_bind_kbd_key(dev_id, var + 5, acts);
+		else
+			in_config_bind_key(dev_id, var + 5, acts, type);
 	}
+	in_clean_binds();
 }
 
 static void parse(const char *var, const char *val, int *keys_encountered)

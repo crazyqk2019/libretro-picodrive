@@ -12,12 +12,16 @@
 #include <dlfcn.h>
 
 #include <pico/pico_int.h>
-#include <pico/sound/mix.h>
-#include "helix/pub/mp3dec.h"
+/*#include "helix/pub/mp3dec.h"*/
 #include "mp3.h"
-#include "lprintf.h"
 
-static HMP3Decoder mp3dec;
+#ifndef _MP3DEC_H
+typedef void *HMP3Decoder;
+#define ERR_MP3_INDATA_UNDERFLOW -1
+#define ERR_MP3_MAINDATA_UNDERFLOW -2
+#endif
+
+static void *mp3dec;
 static unsigned char mp3_input_buffer[2 * 1024];
 
 #ifdef __GP2X__
@@ -37,6 +41,7 @@ int mp3dec_decode(FILE *f, int *file_pos, int file_len)
 	int offset; // mp3 frame offset from readPtr
 	int had_err;
 	int err = 0;
+	int retry = 3;
 
 	do
 	{
@@ -85,9 +90,9 @@ int mp3dec_decode(FILE *f, int *file_pos, int file_len)
 		}
 		*file_pos += readPtr - mp3_input_buffer;
 	}
-	while (0);
+	while (err && --retry > 0);
 
-	return 0;
+	return !!err;
 }
 
 int mp3dec_start(FILE *f, int fpos_start)

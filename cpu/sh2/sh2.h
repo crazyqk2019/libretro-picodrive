@@ -1,15 +1,16 @@
 #ifndef __SH2_H__
 #define __SH2_H__
 
-#include "../../pico/pico_types.h"
-#include "../../pico/pico_port.h"
+#include <pico/pico_types.h>
+#include <pico/pico_port.h>
 
 // registers - matches structure order
 typedef enum {
   SHR_R0 = 0, SHR_SP = 15,
   SHR_PC,  SHR_PPC, SHR_PR,   SHR_SR,
   SHR_GBR, SHR_VBR, SHR_MACH, SHR_MACL,
-  SH2_REGS // register set size
+  SH2_REGS, // register set size
+  SHR_T = 29, SHR_MEM = 30, SHR_TMP = 31, // drc specific pseudo regs
 } sh2_reg_e;
 #define	SHR_R(n)	(SHR_R0+(n))
 
@@ -49,12 +50,15 @@ typedef struct SH2_
 #define SH2_STATE_CPOLL (1 << 2)	// polling comm regs
 #define SH2_STATE_VPOLL (1 << 3)	// polling VDP
 #define SH2_STATE_RPOLL (1 << 4)	// polling address in SDRAM
-#define SH2_TIMER_RUN   (1 << 7)	// SOC WDT timer is running
-#define SH2_IN_DRC      (1 << 8)	// DRC in use
+#define SH2_TIMER_RUN   (1 << 6)	// SOC WDT timer is running
+#define SH2_IN_DRC      (1 << 7)	// DRC in use
 	unsigned int	state;
 	uint32_t	poll_addr;
-	int		poll_cycles;
+	unsigned int	poll_cycles;
 	int		poll_cnt;
+// NB MUST be a bit unused in SH2 SR, see also cpu/sh2/compiler.c!
+#define SH2_NO_POLLING	(1 << 10)	// poll detection control
+	int		no_polling;
 
 	// DRC branch cache. size must be 2^n and <=128
 	int rts_cache_idx;

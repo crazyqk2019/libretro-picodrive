@@ -1,12 +1,12 @@
 /*
  * PicoDrive 32X memory access functions, assembler version
- * (C) KUB, 2018
+ * (C) irixxxx, 2018-2021
  *
  * This work is licensed under the terms of MAME license.
  * See COPYING file in the top-level directory.
  */
 
-#include "../pico_int_offs.h"
+#include <pico/pico_int_offs.h>
 
 @ 32X bank sizes... TODO this should somehow come from an include file
 .equ SH2_ROM_SHIFT, 10      @ 0x003fffff
